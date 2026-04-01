@@ -1,4 +1,19 @@
 services:
+  gateway:
+    build:
+      context: ./gateway
+    env_file: .env
+    volumes:
+      - gateway-data:/data
+    networks:
+      - sandbox
+      - egress
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/healthz')"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+
   agent:
     build:
       context: .
@@ -10,9 +25,27 @@ services:
       - .:/workspace
       - pi-data:/home/pi/.pi/agent
     env_file:
-      - path: .env
-        required: false
+      - path: .env.agent
+        required: true
+    environment:
+      - HTTPS_PROXY=http://gateway:8080
+      - HTTP_PROXY=http://gateway:8080
+      - NO_PROXY=gateway
+      - NODE_EXTRA_CA_CERTS=/usr/local/share/ca-certificates/gateway-ca.crt
+      - NODE_OPTIONS=--use-env-proxy
+      - NODE_NO_WARNINGS=1
+    networks:
+      - sandbox
+    depends_on:
+      gateway:
+        condition: service_healthy
     working_dir: /workspace
+
+networks:
+  sandbox:
+    internal: true
+  egress:
 
 volumes:
   pi-data:
+  gateway-data:

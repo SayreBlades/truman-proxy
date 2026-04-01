@@ -1,5 +1,7 @@
-# Secrets — never commit
+# Secrets — never commit (.env.agent is safe — only dummy keys)
 .env
+!.env.agent
+!.env.example
 **/.assets/
 
 # Python / uv
