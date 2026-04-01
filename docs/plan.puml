@@ -1,0 +1,38 @@
+@startuml
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Container.puml
+
+LAYOUT_LEFT_RIGHT()
+
+Person(user, "Developer", "Interacts via IDE (chat client)")
+
+System_Boundary(host, "Host (trusted)") {
+  Container(frontend, "IDE", "VS Code / TUI / Web", "Thin client — sends prompts, renders responses")
+  ContainerDb(workspace, "/workspace", "project files", "Mounted into devcontainer")
+}
+
+System_Boundary(docker, "Docker") {
+  Container(proxy, "Secret Gateway", "OneCLI / custom proxy", "Intercepts egress HTTP; injects real credentials for allowed hosts. Only container with external network access.")
+  Container(agent, "Devcontainer", "Node.js container", "LLM client + tools (bash, read, write, edit). Sees only placeholder secrets. Internal network only.")
+}
+
+System_Boundary(web, "Web") {
+  System_Ext(llm, "LLM API", "GitHub Copilot")
+  System_Ext(levelup, "LevelUp MCP", "Internal MCP server")
+  System_Ext(artifactory, "Artifactory", "Package registry")
+  System_Ext(github, "GitHub", "Repos, PRs, issues")
+  System_Ext(pubweb, "Public Web", "DuckDuckGo, docs, etc.")
+  System_Ext(intweb, "Internal Web", "Corporate intranet sites")
+}
+
+Rel(user, frontend, "prompts / responses", "stdin or WebSocket")
+Rel(frontend, agent, "tool calls / results", "docker exec or WebSocket")
+Rel(frontend, workspace, "read files")
+Rel(agent, proxy, "HTTP (placeholder creds)", "Docker network")
+Rel(proxy, llm, "HTTP (real creds)")
+Rel(proxy, levelup, "HTTP (real creds)")
+Rel(proxy, artifactory, "HTTP (real creds)")
+Rel(proxy, github, "HTTP (real creds)")
+Rel(proxy, pubweb, "HTTP")
+Rel(proxy, intweb, "HTTP (real creds)")
+Rel(agent, workspace, "read/write files")
+@enduml

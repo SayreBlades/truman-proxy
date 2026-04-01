@@ -1,0 +1,6 @@
+# Secrets — never commit
+.env
+**/.assets/
+
+# Docker
+onecli-data/
