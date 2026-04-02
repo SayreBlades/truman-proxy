@@ -32,16 +32,7 @@ RUN usermod -l pi -d /home/pi -m node \
 # ── 5. Skills — staged at /opt/pi-staging (NOT under the volume) ─
 #    The entrypoint syncs these into the volume on every start,
 #    so rebuilds with updated skills take effect without wiping sessions.
-COPY --from=skills pi-skills/brave-search       /opt/pi-staging/skills/pi-skills/brave-search
-COPY --from=skills pi-skills/gccli              /opt/pi-staging/skills/pi-skills/gccli
-COPY --from=skills pi-skills/gdcli              /opt/pi-staging/skills/pi-skills/gdcli
-COPY --from=skills pi-skills/gmcli              /opt/pi-staging/skills/pi-skills/gmcli
-COPY --from=skills pi-skills/transcribe         /opt/pi-staging/skills/pi-skills/transcribe
-COPY --from=skills pi-skills/youtube-transcript /opt/pi-staging/skills/pi-skills/youtube-transcript
-COPY --from=skills polymarket                   /opt/pi-staging/skills/polymarket
-
-# Install npm deps for skills that need them
-RUN cd /opt/pi-staging/skills/pi-skills/youtube-transcript && npm install --omit=dev
+COPY --from=skills pi-skills      /opt/pi-staging/skills/pi-skills
 
 # ── 6. Default settings (staged) ─────────────────────────────────
 RUN echo '{\n  "defaultProvider": "anthropic",\n  "defaultModel": "claude-sonnet-4-20250514",\n  "defaultThinkingLevel": "high"\n}' \

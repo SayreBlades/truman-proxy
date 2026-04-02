@@ -24,7 +24,6 @@ Builds on [Phase 1](plan-phase-1.md) (pi running in Docker with bind-mounted wor
 
 ## Non-Goals (deferred to later phases)
 
-- OAuth token refresh flows in the gateway
 - Rate limiting / request policy engine
 - Web UI / WebSocket bridge
 - VS Code devcontainer integration
@@ -520,47 +519,23 @@ To add a new service (e.g., Jira, Confluence, npm registry):
 
 ## Future Work
 
-### OAuth credential flows
+### OAuth credential flows (partially implemented)
 
-Phase 2 supports static credentials only (API keys, PATs, OAuth tokens passed as env vars). A future phase should add support for full OAuth 2.0 flows where the gateway manages token lifecycle:
+The gateway now supports **Anthropic OAuth token refresh** natively. When `ANTHROPIC_REFRESH_TOKEN` is set in `.env`, the gateway:
 
-1. **Authorization Code / Device Code flow:** Gateway initiates the OAuth flow on behalf of the agent, prompting the user for consent on the host. The agent never sees the authorization code or client secret.
-2. **Token refresh:** Gateway holds the refresh token + client ID/secret. On each proxied request, the gateway checks if the cached access token is still valid; if expired, it refreshes transparently before injecting.
-3. **Token revocation:** Gateway can revoke tokens when the agent session ends or on demand.
-4. **Multi-provider support:** Different OAuth providers (Google, GitHub OAuth Apps, Atlassian, etc.) each have slightly different flows. The gateway would need a pluggable provider interface.
+1. Obtains a fresh access token on startup
+2. Proactively refreshes before expiry (5-minute margin)
+3. Reactively refreshes on 401 responses (expired token detected)
+4. Updates the refresh token if rotated by the provider
 
-This is a natural extension of the current architecture — credential injection already happens in the gateway, so adding a token cache + refresh loop is straightforward. The agent container requires zero changes; it continues to send dummy credentials that the gateway replaces with live tokens.
+The refresh token is obtained from the host pi installation (`~/.pi/agent/auth.json`) via `make sync-token`. It is long-lived and only needs to be synced once (unless revoked).
 
-**Potential design:** A `credentials.yaml` config file that replaces the current `INTERCEPT_RULES` dict, supporting both static and OAuth credential types:
+**Still deferred:**
 
-```yaml
-credentials:
-  anthropic:
-    type: static
-    hosts: ["api.anthropic.com"]
-    headers:
-      Authorization: "Bearer {ANTHROPIC_OAUTH_TOKEN}"
-
-  github:
-    type: oauth2
-    hosts: ["api.github.com", "github.com"]
-    provider: github
-    client_id: "{GH_OAUTH_CLIENT_ID}"
-    client_secret: "{GH_OAUTH_CLIENT_SECRET}"
-    scopes: ["repo", "read:org"]
-    headers:
-      Authorization: "token {access_token}"
-
-  jira:
-    type: oauth2
-    hosts: ["*.atlassian.net"]
-    provider: atlassian
-    client_id: "{ATLASSIAN_CLIENT_ID}"
-    client_secret: "{ATLASSIAN_CLIENT_SECRET}"
-    scopes: ["read:jira-work", "write:jira-work"]
-    headers:
-      Authorization: "Bearer {access_token}"
-```
+1. **Authorization Code / Device Code flow:** Gateway initiating OAuth flows on behalf of the agent (currently the user runs `/login` in host pi and syncs the refresh token).
+2. **Multi-provider OAuth:** GitHub OAuth Apps, Atlassian, Google, etc. Currently only Anthropic has refresh support; others use static tokens/keys.
+3. **Token revocation:** Revoking tokens when the agent session ends.
+4. **`credentials.yaml` config:** A declarative config file replacing the current `INTERCEPT_RULES` dict, supporting both static and OAuth credential types.
 
 ### Rate limiting / policy engine
 
@@ -590,5 +565,4 @@ Currently the gateway allows traffic to any host (blind tunnel for unknown hosts
 | gh CLI + git integration     | ✅ **This phase** (transparent via MITM)            |
 | VS Code devcontainer         | ❌ Deferred                                         |
 | Web access (browser chat UI) | ❌ Deferred                                         |
-| OAuth credential flows       | ❌ Deferred (token refresh, auth code, device code) |
 | Policy engine / rate limits  | ❌ Deferred                                         |

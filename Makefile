@@ -1,4 +1,4 @@
-.PHONY: help build run prompt rpc shell shell-gateway logs clean
+.PHONY: help build run prompt rpc shell shell-gateway logs clean sync-token
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
@@ -25,6 +25,24 @@ shell-gateway: build ## Shell into the gateway container (for debugging)
 
 logs: ## Show gateway logs
 	docker compose logs -f gateway
+
+sync-token: ## Sync Anthropic OAuth refresh token from host pi into .env
+	@AUTH_FILE="$$HOME/.pi/agent/auth.json"; \
+	if [ ! -f "$$AUTH_FILE" ]; then \
+		echo "Error: $$AUTH_FILE not found. Run 'pi' and '/login' first." >&2; exit 1; \
+	fi; \
+	REFRESH=$$(python3 -c "import json; print(json.load(open('$$AUTH_FILE'))['anthropic']['refresh'])" 2>/dev/null); \
+	if [ -z "$$REFRESH" ]; then \
+		echo "Error: No Anthropic OAuth credentials in $$AUTH_FILE. Run 'pi' and '/login' first." >&2; exit 1; \
+	fi; \
+	if [ -f .env ] && grep -q '^ANTHROPIC_REFRESH_TOKEN=' .env; then \
+		sed -i '' "s|^ANTHROPIC_REFRESH_TOKEN=.*|ANTHROPIC_REFRESH_TOKEN=$$REFRESH|" .env; \
+	elif [ -f .env ]; then \
+		echo "ANTHROPIC_REFRESH_TOKEN=$$REFRESH" >> .env; \
+	else \
+		echo "ANTHROPIC_REFRESH_TOKEN=$$REFRESH" > .env; \
+	fi; \
+	echo "✓ Synced ANTHROPIC_REFRESH_TOKEN into .env"
 
 clean: ## Remove containers, volumes, and images
 	docker compose down -v --rmi local

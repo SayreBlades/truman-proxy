@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime
+import json as json_mod
 import logging
 import os
 import queue as queue_mod
@@ -22,6 +23,7 @@ import re
 import socket as socket_mod
 import ssl
 import tempfile
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -39,6 +41,114 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger("gateway")
+
+# ── Anthropic OAuth Token Manager ────────────────────────────────────
+
+ANTHROPIC_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+ANTHROPIC_TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
+# Refresh 5 minutes before actual expiry
+TOKEN_REFRESH_MARGIN_S = 5 * 60
+
+
+class AnthropicTokenManager:
+    """Manages Anthropic OAuth access tokens via refresh token.
+
+    Holds a long-lived refresh token (from .env) and uses it to obtain
+    short-lived access tokens.  Tokens are refreshed proactively before
+    expiry and reactively on 401 responses.
+
+    The latest refresh token is persisted to disk so that gateway restarts
+    survive token rotation (Anthropic invalidates old refresh tokens when
+    issuing new ones).
+    """
+
+    def __init__(self, refresh_token: str) -> None:
+        # Try to load a previously-persisted (rotated) token first
+        persisted = self._load_persisted()
+        if persisted:
+            log.info("Loaded persisted refresh token from %s", self._token_path())
+            self._refresh_token = persisted
+        else:
+            self._refresh_token = refresh_token
+        self._access_token: Optional[str] = None
+        self._expires_at: float = 0  # unix timestamp (seconds)
+        self._lock = asyncio.Lock()
+
+    async def get_access_token(self, http_session: aiohttp.ClientSession) -> str:
+        """Return a valid access token, refreshing if necessary."""
+        if self._access_token and time.time() < self._expires_at:
+            return self._access_token
+        return await self._refresh(http_session)
+
+    async def force_refresh(self, http_session: aiohttp.ClientSession) -> str:
+        """Force a token refresh (e.g. after a 401)."""
+        return await self._refresh(http_session)
+
+    async def _refresh(self, http_session: aiohttp.ClientSession) -> str:
+        async with self._lock:
+            # Double-check after acquiring lock (another coroutine may have refreshed)
+            if self._access_token and time.time() < self._expires_at:
+                return self._access_token
+
+            log.info("Refreshing Anthropic OAuth access token...")
+            async with http_session.post(
+                ANTHROPIC_TOKEN_URL,
+                json={
+                    "grant_type": "refresh_token",
+                    "client_id": ANTHROPIC_CLIENT_ID,
+                    "refresh_token": self._refresh_token,
+                },
+                headers={
+                    "Content-Type": "application/json",
+                    "Accept": "application/json",
+                },
+            ) as resp:
+                body = await resp.text()
+                if not resp.ok:
+                    log.error("Token refresh failed: %d %s", resp.status, body)
+                    raise RuntimeError(f"Anthropic token refresh failed: {resp.status} {body}")
+                data = json_mod.loads(body)
+
+            self._access_token = data["access_token"]
+            expires_in = data.get("expires_in", 3600)
+            self._expires_at = time.time() + expires_in - TOKEN_REFRESH_MARGIN_S
+            # Update and persist refresh token if rotated
+            if data.get("refresh_token"):
+                self._refresh_token = data["refresh_token"]
+                self._persist()
+            log.info("Anthropic OAuth token refreshed (expires in %ds)", expires_in)
+            return self._access_token
+
+    @staticmethod
+    def _token_path() -> Path:
+        return Path(os.environ.get("CA_DIR", "/data")) / "anthropic_token.json"
+
+    def _persist(self) -> None:
+        """Save the current refresh token to disk for restart survival."""
+        try:
+            p = self._token_path()
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(json_mod.dumps({"refresh_token": self._refresh_token}))
+            log.info("Persisted rotated refresh token to %s", p)
+        except Exception as exc:
+            log.warning("Failed to persist refresh token: %s", exc)
+
+    @staticmethod
+    def _load_persisted() -> Optional[str]:
+        """Load a previously-persisted refresh token, if any."""
+        try:
+            p = AnthropicTokenManager._token_path()
+            if p.exists():
+                data = json_mod.loads(p.read_text())
+                return data.get("refresh_token")
+        except Exception as exc:
+            log.warning("Failed to load persisted token: %s", exc)
+        return None
+
+
+# Initialized at startup if ANTHROPIC_REFRESH_TOKEN is set
+_anthropic_token_mgr: Optional[AnthropicTokenManager] = None
+
 
 # ── Credential injection rules ───────────────────────────────────────
 
@@ -77,7 +187,12 @@ RESOLVED_RULES: dict[str, dict] = {}
 
 
 def resolve_rules() -> dict[str, dict]:
-    """Resolve env-var placeholders in inject_headers at startup."""
+    """Resolve env-var placeholders in inject_headers at startup.
+
+    For ANTHROPIC_OAUTH_TOKEN: if ANTHROPIC_REFRESH_TOKEN is set, the
+    header value is resolved dynamically at request time (marked with a
+    sentinel).  Otherwise falls back to a static token from env.
+    """
     resolved: dict[str, dict] = {}
     for host, rule in INTERCEPT_RULES.items():
         inject: dict[str, str] = {}
@@ -87,6 +202,14 @@ def resolve_rules() -> dict[str, dict]:
             if not match:
                 continue
             var = match.group(1)
+
+            # Dynamic OAuth: if we have a refresh token manager for this var,
+            # mark the header for dynamic resolution at request time
+            if var == "ANTHROPIC_OAUTH_TOKEN" and _anthropic_token_mgr is not None:
+                inject[header] = "__DYNAMIC_ANTHROPIC_OAUTH__"
+                log.info("  %s: %s → will inject %s (dynamic refresh)", host, var, header)
+                continue
+
             value = os.environ.get(var)
             if value:
                 inject[header] = template.replace(f"{{{var}}}", value)
@@ -98,6 +221,21 @@ def resolve_rules() -> dict[str, dict]:
             "inject_headers": inject,
         }
     return resolved
+
+
+async def resolve_dynamic_headers(
+    headers: dict[str, str],
+    http_session: aiohttp.ClientSession,
+) -> dict[str, str]:
+    """Replace dynamic sentinel values with live tokens."""
+    if not _anthropic_token_mgr:
+        return headers
+    result = dict(headers)
+    for key, value in result.items():
+        if value == "__DYNAMIC_ANTHROPIC_OAUTH__":
+            token = await _anthropic_token_mgr.get_access_token(http_session)
+            result[key] = f"Bearer {token}"
+    return result
 
 
 # ── CA Manager ───────────────────────────────────────────────────────
@@ -357,6 +495,12 @@ def _mitm_sync(
         for key, value in rule["inject_headers"].items():
             out_headers[key] = value
 
+        # Resolve dynamic tokens (e.g. OAuth access tokens from refresh flow)
+        future = asyncio.run_coroutine_threadsafe(
+            resolve_dynamic_headers(out_headers, http_session), loop,
+        )
+        out_headers = future.result(timeout=30)
+
         # Remove hop-by-hop + Accept-Encoding (so upstream sends uncompressed;
         # avoids gzip mismatch since aiohttp auto-decompresses)
         for hdr in list(out_headers.keys()):
@@ -369,14 +513,26 @@ def _mitm_sync(
         # Use a thread-safe queue to stream response from async to sync
         q: queue_mod.Queue = queue_mod.Queue()
 
-        async def do_upstream():
+        async def do_upstream(headers_to_send: dict[str, str], retry_on_401: bool = True):
             try:
                 async with http_session.request(
                     method, url,
-                    headers=out_headers,
+                    headers=headers_to_send,
                     data=body,
                     allow_redirects=False,
                 ) as resp:
+                    # On 401 with a refresh-capable token, force-refresh and retry once
+                    if resp.status == 401 and retry_on_401 and _anthropic_token_mgr:
+                        resp_body = await resp.text()
+                        if "expired" in resp_body.lower() or "authentication" in resp_body.lower():
+                            log.warning("Got 401 from %s, forcing token refresh...", hostname)
+                            new_token = await _anthropic_token_mgr.force_refresh(http_session)
+                            refreshed_headers = dict(headers_to_send)
+                            for k in refreshed_headers:
+                                if k.lower() == "authorization" and "Bearer" in refreshed_headers[k]:
+                                    refreshed_headers[k] = f"Bearer {new_token}"
+                            await do_upstream(refreshed_headers, retry_on_401=False)
+                            return
                     q.put(("headers", resp.status, resp.reason or "OK",
                            list(resp.headers.items())))
                     async for chunk in resp.content.iter_any():
@@ -385,7 +541,7 @@ def _mitm_sync(
             except Exception as exc:
                 q.put(("error", exc))
 
-        asyncio.run_coroutine_threadsafe(do_upstream(), loop)
+        asyncio.run_coroutine_threadsafe(do_upstream(out_headers), loop)
 
         # Read header message from queue
         msg = q.get(timeout=120)
@@ -623,9 +779,18 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
 # ── Main ─────────────────────────────────────────────────────────────
 
 async def main() -> None:
-    global _ca_key, _ca_cert, _http_session, RESOLVED_RULES
+    global _ca_key, _ca_cert, _http_session, RESOLVED_RULES, _anthropic_token_mgr
 
     log.info("Starting secret gateway...")
+
+    # ── Initialize Anthropic OAuth token manager (if refresh token set) ──
+    refresh_token = os.environ.get("ANTHROPIC_REFRESH_TOKEN")
+    if refresh_token:
+        log.info("ANTHROPIC_REFRESH_TOKEN set → enabling OAuth auto-refresh")
+        _anthropic_token_mgr = AnthropicTokenManager(refresh_token)
+    else:
+        log.info("ANTHROPIC_REFRESH_TOKEN not set → using static credentials")
+
     log.info("Resolving credential injection rules:")
     RESOLVED_RULES = resolve_rules()
 
@@ -638,6 +803,15 @@ async def main() -> None:
             force_close=True,  # Don't reuse connections — avoids stale keepalive
         ),
     )
+
+    # ── Pre-fetch initial access token so first request isn't slow ──
+    if _anthropic_token_mgr:
+        try:
+            await _anthropic_token_mgr.get_access_token(_http_session)
+            log.info("Initial Anthropic access token acquired")
+        except Exception as exc:
+            log.error("Failed to acquire initial Anthropic token: %s", exc)
+            log.error("Requests to api.anthropic.com will fail until refresh succeeds")
 
     server = await asyncio.start_server(handle_client, "0.0.0.0", 8080)
 

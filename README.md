@@ -5,16 +5,22 @@ Run [pi](https://github.com/badlogic/pi-mono) inside a Docker container with the
 ## Prerequisites
 
 - Docker Desktop (or Docker Engine + Compose plugin)
-- Real API keys (Anthropic, Brave, optionally GitHub)
+- A [pi](https://github.com/badlogic/pi-mono) installation on the host (for OAuth login)
+- Optionally: Brave API key, GitHub PAT
 
 ## Quick Start
 
 ```bash
-# 1. Add your real API keys (gateway only — never enters the agent)
-cp .env.example .env
-# Edit .env with your real keys
+# 1. Log in to Anthropic via pi on the host (if not already)
+pi    # then type /login → select Anthropic
 
-# 2. Build and run interactively
+# 2. Sync your OAuth refresh token into .env
+make sync-token
+
+# 3. Add other keys (Brave, GitHub) to .env
+# Edit .env — see .env.example for all options
+
+# 4. Build and run interactively
 make run
 ```
 
@@ -49,11 +55,13 @@ make run
 
 ### Credential Flow
 
-| Service        | Agent sees              | Gateway injects              |
-|----------------|-------------------------|------------------------------|
-| Anthropic API  | `sk-ant-oat01-DUMMY...` | Real `ANTHROPIC_OAUTH_TOKEN` |
-| Brave Search   | `BSAdummy...`           | Real `BRAVE_API_KEY`         |
-| GitHub API/git | `ghp_DUMMY...`          | Real `GH_TOKEN`              |
+| Service        | Agent sees              | Gateway injects                              |
+|----------------|-------------------------|----------------------------------------------|
+| Anthropic API  | `sk-ant-oat01-DUMMY...` | Auto-refreshed OAuth token (from `.env`)     |
+| Brave Search   | `BSAdummy...`           | Real `BRAVE_API_KEY`                         |
+| GitHub API/git | `ghp_DUMMY...`          | Real `GH_TOKEN`                              |
+
+The gateway holds a long-lived **refresh token** for Anthropic and automatically obtains short-lived access tokens. Tokens are refreshed proactively before expiry and reactively on 401 responses — no manual token rotation needed.
 
 ## Make Targets
 
@@ -67,6 +75,7 @@ make run
 | `make shell`        | Bash shell in agent (for debugging)    |
 | `make shell-gateway`| Bash shell in gateway (for debugging)  |
 | `make logs`         | Stream gateway logs                    |
+| `make sync-token`   | Sync Anthropic OAuth token from host pi |
 | `make clean`        | Remove containers, volumes, and images |
 
 ## API Keys
@@ -81,8 +90,15 @@ Two env files:
 ### Required in `.env`
 
 ```bash
-ANTHROPIC_OAUTH_TOKEN=sk-ant-oat01-...   # or ANTHROPIC_API_KEY=sk-ant-api03-...
+# Recommended: OAuth refresh token (auto-refreshes, never expires)
+ANTHROPIC_REFRESH_TOKEN=sk-ant-ort01-...
+
+# Alternatives (pick one):
+# ANTHROPIC_OAUTH_TOKEN=sk-ant-oat01-...   # Static OAuth token (expires in hours)
+# ANTHROPIC_API_KEY=sk-ant-api03-...        # API key (requires paid API plan)
 ```
+
+Use `make sync-token` to extract the refresh token from your host pi installation automatically.
 
 ### Optional in `.env`
 
