@@ -30,5 +30,27 @@ if [ ! -f /home/pi/.pi/agent/settings.json ]; then
     cp /opt/pi-staging/settings.json /home/pi/.pi/agent/settings.json
 fi
 
+# ── Git / GitHub setup ────────────────────────────────────────────
+# Configure gh as git's credential helper so that git push/pull through
+# the gateway proxy works without interactive prompts.  The agent's
+# dummy GH_TOKEN is sent through the proxy; the gateway replaces it
+# with the real token before it reaches GitHub.
+gosu pi gh auth setup-git 2>/dev/null || true
+gosu pi git config --global push.autoSetupRemote true
+
+# Auto-configure git identity from GitHub profile (via gateway proxy).
+# Only if not already set — preserves manual overrides.
+if ! gosu pi git config --global user.name &>/dev/null; then
+    GH_USER_JSON=$(gosu pi curl -sf https://api.github.com/user 2>/dev/null || true)
+    if [ -n "$GH_USER_JSON" ]; then
+        GH_NAME=$(echo "$GH_USER_JSON" | jq -r '.name // .login')
+        GH_ID=$(echo "$GH_USER_JSON" | jq -r '.id')
+        GH_LOGIN=$(echo "$GH_USER_JSON" | jq -r '.login')
+        gosu pi git config --global user.name "$GH_NAME"
+        gosu pi git config --global user.email "${GH_ID}+${GH_LOGIN}@users.noreply.github.com"
+        echo "Git identity: $GH_NAME <${GH_ID}+${GH_LOGIN}@users.noreply.github.com>"
+    fi
+fi
+
 # ── Drop to non-root user ────────────────────────────────────────
 exec gosu pi "$@"
