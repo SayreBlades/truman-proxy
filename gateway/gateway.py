@@ -453,7 +453,7 @@ def _mitm_sync(
     Streams response chunks back to the client for SSE support.
     """
     ssl_sock.settimeout(300)
-    rfile = ssl_sock.makefile("rb", buffering=0)
+    rfile = ssl_sock.makefile("rb")  # default buffering — ensures read(n) returns exactly n bytes
 
     try:
         # Read HTTP request line
@@ -508,7 +508,7 @@ def _mitm_sync(
                 del out_headers[hdr]
 
         url = f"https://{hostname}{path}" if port == 443 else f"https://{hostname}:{port}{path}"
-        log.info("MITM %s %s", method, url)
+        log.info("MITM %s %s (body: %s bytes)", method, url, len(body) if body else 0)
 
         # Use a thread-safe queue to stream response from async to sync
         q: queue_mod.Queue = queue_mod.Queue()
@@ -597,6 +597,10 @@ def _mitm_sync(
         except Exception:
             pass
     finally:
+        try:
+            rfile.close()
+        except Exception:
+            pass
         try:
             ssl_sock.shutdown(2)
         except Exception:
