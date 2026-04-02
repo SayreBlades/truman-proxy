@@ -14,6 +14,7 @@ See docs/plan-phase-2.md for full design.
 from __future__ import annotations
 
 import asyncio
+import base64
 import datetime
 import json as json_mod
 import logging
@@ -175,7 +176,7 @@ INTERCEPT_RULES: dict[str, dict] = {
     "github.com": {
         "strip_headers": ["authorization"],
         "inject_headers": {
-            "Authorization": "token {GH_TOKEN}",
+            "Authorization": "basic {GH_TOKEN}",
         },
     },
 }
@@ -212,7 +213,13 @@ def resolve_rules() -> dict[str, dict]:
 
             value = os.environ.get(var)
             if value:
-                inject[header] = template.replace(f"{{{var}}}", value)
+                # "basic {VAR}" → HTTP Basic auth (x-access-token:<token>)
+                # Used for github.com git smart-HTTP which requires Basic auth
+                if template.startswith("basic "):
+                    creds = base64.b64encode(f"x-access-token:{value}".encode()).decode()
+                    inject[header] = f"Basic {creds}"
+                else:
+                    inject[header] = template.replace(f"{{{var}}}", value)
                 log.info("  %s: %s → will inject %s", host, var, header)
             else:
                 log.info("  %s: %s not set, skipping %s", host, var, header)
