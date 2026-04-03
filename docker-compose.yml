@@ -24,6 +24,8 @@ services:
     tty: true              # -t
     volumes:
       - .:/workspace
+      - /dev/null:/workspace/.env:ro          # Hide real secrets from agent
+      - /dev/null:/workspace/.env.example:ro  # Hide template too
       - pi-data:/home/pi/.pi/agent
     env_file:
       - path: .env.agent

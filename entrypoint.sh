@@ -12,6 +12,12 @@ if [ -n "$HTTPS_PROXY" ]; then
     echo "Gateway CA certificate installed."
 fi
 
+# ── Security: verify real secrets aren't leaked into workspace ────
+if [ -f /workspace/.env ] && grep -qE 'sk-ant-ort01-|BSAp-|gho_' /workspace/.env 2>/dev/null; then
+    echo "⚠️  WARNING: Real secrets detected in /workspace/.env!" >&2
+    echo "   Container may be misconfigured. Check volume mounts." >&2
+fi
+
 # ── Skills sync ──────────────────────────────────────────────────
 # Sync baked-in skills from the image staging area into the persistent volume.
 # This ensures rebuilds with updated skills take effect without wiping sessions.
