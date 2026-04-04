@@ -138,14 +138,15 @@ This is useful for scripting or when you don't need devcontainer features.
 
 VS Code provides features that the devcontainer CLI does not:
 
-| Feature | VS Code | Devcontainer CLI |
-|---------|---------|------------------|
-| Automatic port forwarding | ✅ Detects new listeners, tunnels to host | ❌ No port forwarding |
-| Port auto-detection | ✅ Notification + "Open in Browser" | ❌ |
-| `forwardPorts` / `portsAttributes` | ✅ Full support | ❌ Ignored |
-| Extension installation | ✅ Installs in container | ❌ N/A |
-| Interactive terminal | ✅ Integrated | ✅ Via `devcontainer exec ... bash` |
-| Run commands | ✅ Terminal | ✅ `devcontainer exec` |
+| Feature                            | VS Code                                   | Devcontainer CLI                    |
+|------------------------------------|-------------------------------------------|-------------------------------------|
+| Automatic port forwarding          | ✅ Detects new listeners, tunnels to host | ❌ No port forwarding               |
+| Port auto-detection                | ✅ Notification + "Open in Browser"       | ❌                                  |
+| `forwardPorts` / `portsAttributes` | ✅ Full support                           | ❌ Ignored                          |
+| Extension installation             | ✅ Installs in container                  | ❌ N/A                              |
+| Interactive terminal               | ✅ Integrated                             | ✅ Via `devcontainer exec ... bash` |
+| Run commands                       | ✅ Terminal                               | ✅ `devcontainer exec`              |
+| Multiple configs simultaneously    | ✅ Separate windows                       | ⚠️ One at a time (see below)        |
 
 The devcontainer CLI is a headless tool — it starts containers and runs commands, but there is no background process watching for new port listeners or managing tunnels. If you're running a web server inside the sandboxed agent container, you won't be able to reach it from your host browser via the CLI alone.
 
@@ -277,26 +278,33 @@ volumes:
 
 You can open both simultaneously in separate VS Code windows.
 
-**Devcontainer CLI** — use `--config` to select:
+**Devcontainer CLI** — the CLI can only manage **one config at a time** per compose project. You pick which container to attach to with `--config`; `devcontainer exec` works for that one, and you use `docker exec` for the other.
 
 ```bash
-# Start all containers
+# Option A: Work in the dev container (human development)
 devcontainer up --workspace-folder . --config .devcontainer/dev/devcontainer.json
-
-# Work in the dev container (port forwarding, internet access)
 devcontainer exec --workspace-folder . --config .devcontainer/dev/devcontainer.json bash
 
-# Or attach to the sandboxed agent
+# The agent container is also running — use docker exec to reach it:
+docker exec -it -u pi $(docker ps -qf "name=.*agent") pi
+
+# Option B: Work in the sandboxed agent
+devcontainer up --workspace-folder . --config .devcontainer/agent/devcontainer.json
 devcontainer exec --workspace-folder . --config .devcontainer/agent/devcontainer.json pi
+
+# The dev container is also running — use docker exec to reach it:
+docker exec -it -u pi $(docker ps -qf "name=.*dev") bash
 ```
 
-|                     | Agent container           | Dev container                      |
-|---------------------|---------------------------|------------------------------------|
-| **Purpose**         | AI agent (pi)             | Human developer                    |
-| **Network**         | `sandbox` only (isolated) | `sandbox` + `egress` (full access) |
-| **Internet**        | Through gateway only      | Direct                             |
-| **Port forwarding** | No (by design)            | ✅ Works in VS Code                |
-| **Credentials**     | Dummy (gateway injects)   | No credential injection            |
+> **Note:** `devcontainer up` starts **all** services in docker-compose.yml regardless of which `--config` you choose. The `--config` only controls which container `devcontainer exec` attaches to. VS Code does not have this limitation — it can open both configs simultaneously in separate windows.
+
+|                        | Agent container           | Dev container                      |
+|------------------------|---------------------------|------------------------------------|
+| **Purpose**            | AI agent (pi)             | Human developer                    |
+| **Network**            | `sandbox` only (isolated) | `sandbox` + `egress` (full access) |
+| **Internet**           | Through gateway only      | Direct                             |
+| **Port forwarding**    | No (by design)            | ✅ Works in VS Code                |
+| **Credentials**        | Dummy (gateway injects)   | No credential injection            |
 
 ## Customization
 

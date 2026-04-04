@@ -36,21 +36,39 @@ You can open both simultaneously in separate VS Code windows.
 
 ### Devcontainer CLI
 
+The devcontainer CLI can only manage **one config at a time** per compose project. You pick which container to attach to — `devcontainer exec` works for that one, and you use `docker exec` for the other.
+
 ```bash
-# Start with the dev container
+# Option A: Work in the dev container (human development)
 devcontainer up --workspace-folder . --config .devcontainer/dev/devcontainer.json
-
-# Or start with the sandboxed agent
-devcontainer up --workspace-folder . --config .devcontainer/agent/devcontainer.json
-
-# Run commands in dev container
 devcontainer exec --workspace-folder . --config .devcontainer/dev/devcontainer.json bash
 
-# Run pi in the sandboxed agent
+# The agent container is also running — use docker exec to reach it:
+docker exec -it -u pi $(docker ps -qf "name=temperature.*agent") pi
+
+# Option B: Work in the sandboxed agent
+devcontainer up --workspace-folder . --config .devcontainer/agent/devcontainer.json
 devcontainer exec --workspace-folder . --config .devcontainer/agent/devcontainer.json pi
+
+# The dev container is also running — use docker exec to reach it:
+docker exec -it -u pi $(docker ps -qf "name=temperature.*dev") bash
+```
+
+> **Note:** `devcontainer up` starts **all** services in docker-compose.yml regardless of which `--config` you choose. The `--config` only controls which container `devcontainer exec` attaches to. VS Code does not have this limitation — it can open both configs simultaneously in separate windows.
+
+### Teardown
+
+```bash
+# Stop (preserves volumes / pi sessions)
+docker compose -f .devcontainer/docker-compose.yml down
+
+# Stop and wipe everything (clean slate)
+docker compose -f .devcontainer/docker-compose.yml down -v
 ```
 
 ### Docker Compose (direct)
+
+Bypasses the devcontainer layer entirely — useful for scripting or quick interactive sessions:
 
 ```bash
 # Interactive pi session in the sandboxed agent
@@ -58,9 +76,6 @@ docker compose -f .devcontainer/docker-compose.yml run --rm agent
 
 # Shell into the dev container
 docker compose -f .devcontainer/docker-compose.yml run --rm dev bash
-
-# Stop everything
-docker compose -f .devcontainer/docker-compose.yml down -v
 ```
 
 ## Usage
