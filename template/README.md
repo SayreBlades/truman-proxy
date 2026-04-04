@@ -218,9 +218,21 @@ services:
     volumes:
       - ..:/workspace
       - /dev/null:/workspace/.devcontainer/.env:ro
+      - pi-data:/home/pi/.pi/agent
+      - ~/.pi/agent/skills:/opt/pi-custom/skills:ro
+      - ~/.pi/agent/prompts:/opt/pi-custom/prompts:ro
+    env_file: [{ path: .env.agent, required: true }]
+    environment:
+      - HTTPS_PROXY=http://gateway:8080
+      - HTTP_PROXY=http://gateway:8080
+      - NO_PROXY=gateway
+      - NODE_EXTRA_CA_CERTS=/usr/local/share/ca-certificates/gateway-ca.crt
+      - NODE_OPTIONS=--use-env-proxy
+      - NODE_NO_WARNINGS=1
     networks:
       - sandbox     # Can talk to gateway and agent
       - egress      # Direct internet access
+    depends_on: { gateway: { condition: service_healthy } }
     working_dir: /workspace
     command: sleep infinity
 
