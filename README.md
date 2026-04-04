@@ -179,7 +179,6 @@ See the **[template README](template/README.md)** for detailed instructions on:
 
 ```bash
 make build          # Build gateway + agent images locally
-make test-example   # Test with the temperature-converter example
 make publish        # Push images to ghcr.io
 make clean          # Remove locally-built images
 ```

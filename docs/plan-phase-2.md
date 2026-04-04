@@ -532,7 +532,7 @@ The gateway now supports **Anthropic OAuth token refresh** natively. When `ANTHR
 3. Reactively refreshes on 401 responses (expired token detected)
 4. Updates the refresh token if rotated by the provider
 
-The refresh token is obtained from the host pi installation (`~/.pi/agent/auth.json`) via `make sync-token`. It is long-lived and only needs to be synced once (unless revoked).
+The refresh token is obtained from the host pi installation (`~/.pi/agent/auth.json`) via `.devcontainer/sync-token.sh`. It is long-lived and only needs to be synced once (unless revoked).
 
 **Still deferred:**
 
