@@ -1,0 +1,16 @@
+{
+  "name": "Agent (Sandboxed)",
+  "dockerComposeFile": "../docker-compose.yml",
+  "service": "agent",
+  "workspaceFolder": "/workspace",
+  "overrideCommand": false,
+  "remoteUser": "pi",
+  "shutdownAction": "none",
+  "customizations": {
+    "vscode": {
+      "settings": {
+        "terminal.integrated.defaultProfile.linux": "bash"
+      }
+    }
+  }
+}

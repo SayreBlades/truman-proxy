@@ -1,4 +1,5 @@
 # Truman example: temperature converter
+# Three services: gateway (proxy), agent (sandboxed AI), dev (human developer).
 # Uses published images (run `make build` from repo root to build locally).
 
 services:
@@ -17,6 +18,7 @@ services:
       retries: 3
 
   agent:
+    # Sandboxed — AI agent runs here, all traffic through gateway
     image: ghcr.io/sayreblades/truman-agent:latest
     volumes:
       - ..:/workspace
@@ -44,10 +46,24 @@ services:
     working_dir: /workspace
     command: sleep infinity
 
+  dev:
+    # Normal dev environment — human works here
+    # Same base image, but with direct internet access and port forwarding.
+    image: ghcr.io/sayreblades/truman-agent:latest
+    volumes:
+      - ..:/workspace
+      - /dev/null:/workspace/.devcontainer/.env:ro
+      - /dev/null:/workspace/.devcontainer/.env.example:ro
+    networks:
+      - sandbox     # Can talk to gateway and agent
+      - egress      # Direct internet access
+    working_dir: /workspace
+    command: sleep infinity
+
 networks:
   sandbox:
-    internal: true
-  egress:
+    internal: true    # Agent cannot reach internet directly
+  egress:             # Gateway and dev can reach internet
 
 volumes:
   pi-data:
