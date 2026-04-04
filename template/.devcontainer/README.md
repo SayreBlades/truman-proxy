@@ -1,18 +1,16 @@
-# Truman Devcontainer Template
+# Truman Devcontainer
 
-Copy the `.devcontainer/` directory into your project to get a sandboxed pi agent runtime.
+This `.devcontainer/` directory provides a sandboxed [pi](https://github.com/badlogic/pi-mono) agent runtime with credential injection for your project.
 
 ## Quick Start
 
-```bash
-# 1. Copy .devcontainer/ into your project
-cp -r .devcontainer/ /path/to/your-project/.devcontainer/
+Copy this template `.devcontainer/` directory into your project to get a sandboxed pi agent runtime.
 
-# 2. Run the interactive setup wizard
-cd /path/to/your-project
+```bash
+# 1. Run the interactive setup wizard
 .devcontainer/truman.sh init
 
-# 3. Start the devcontainer
+# 2. Start the devcontainer
 .devcontainer/truman.sh start
 ```
 

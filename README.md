@@ -32,11 +32,7 @@ cd /path/to/your-project
 .devcontainer/truman.sh start
 ```
 
-Then start using it — see the [template README](template/README.md) for full usage instructions:
-
-- **[VS Code](template/README.md#vs-code)** — "Reopen in Container" for a full IDE experience
-- **[Devcontainer CLI](template/README.md#devcontainer-cli)** — `devcontainer up` + `devcontainer exec` from any terminal
-- **[Docker Compose](template/README.md#docker-compose-direct)** — `docker compose run --rm agent` for quick interactive sessions
+See the **[devcontainer README](template/.devcontainer/README.md)** for full usage instructions covering VS Code, the devcontainer CLI, docker compose, multi-container setups, and customization.
 
 ## Architecture
 
@@ -97,8 +93,9 @@ truman/
 │   └── agent/            # Pi coding agent container
 │       ├── Dockerfile
 │       └── entrypoint.sh
-├── template/             # Copy into your project
+├── template/             # Copy .devcontainer/ into your project
 │   └── .devcontainer/
+│       ├── README.md
 │       ├── devcontainer.json
 │       ├── docker-compose.yml
 │       └── truman.sh
@@ -116,90 +113,6 @@ Published to GitHub Container Registry:
 | `ghcr.io/sayreblades/truman-gateway` | MITM proxy with credential injection |
 | `ghcr.io/sayreblades/truman-agent`   | Pi coding agent with tools           |
 
-## Gateway Configuration
-
-The gateway is configured via a single YAML file (`gateway.yaml`) that declares per-host interception rules and credentials. No image rebuild needed to add services.
-
-### Token sharing
-
-OAuth hosts (like Anthropic) support a shared token file via `token_file` + `token_file_key`. This lets the gateway and host tools (like `pi`) share a single access token instead of competing with separate refreshes. The host's `~/.pi/agent/auth.json` is mounted into the gateway container at `/host-auth/auth.json`.
-
-When the gateway starts, it reads the existing access token from the file — no refresh needed. If the token expires, whichever side (host or gateway) detects it first refreshes and writes back, and the other picks up the new token.
-
-### Adding a new service (API key)
-
-Edit `gateway.yaml`:
-
-```yaml
-api.openai.com:
-  type: apikey
-  strip_headers: [authorization]
-  inject_headers:
-    Authorization: "Bearer $API_KEY"
-  api_key: "sk-proj-YOUR-REAL-KEY"
-  agent_env:
-    OPENAI_API_KEY: "sk-proj-DUMMY0000000000000000000000"
-```
-
-Run `setup.sh` to regenerate `.env.agent`. Done — no image rebuild required.
-
-### Adding a new service (OAuth)
-
-For well-known providers in the gateway's built-in registry:
-
-```yaml
-api.newprovider.com:
-  type: oauth
-  provider: newprovider
-  strip_headers: [authorization]
-  inject_headers:
-    Authorization: "Bearer $ACCESS_TOKEN"
-  refresh_token: "rt-YOUR-REFRESH-TOKEN"
-```
-
-For custom OAuth providers, specify protocol details directly:
-
-```yaml
-auth.custom-saas.com:
-  type: oauth
-  token_url: "https://auth.custom-saas.com/oauth/token"
-  client_id: "your-app-client-id"
-  content_type: form
-  strip_headers: [authorization]
-  inject_headers:
-    Authorization: "Bearer $ACCESS_TOKEN"
-  refresh_token: "your-refresh-token"
-```
-
-## Skills & Prompts
-
-Three ways to provide pi skills and prompts to the agent:
-
-### (a) Baked into an extended image
-
-```dockerfile
-FROM ghcr.io/sayreblades/truman-agent:latest
-COPY my-skills/ /opt/pi-staging/skills/my-skills/
-COPY my-prompts/ /opt/pi-staging/prompts/
-```
-
-### (b) Mounted at runtime
-
-In `docker-compose.yml`:
-
-```yaml
-agent:
-  volumes:
-    - ~/.pi/agent/skills:/opt/pi-custom/skills:ro
-    - ~/.pi/agent/prompts:/opt/pi-custom/prompts:ro
-```
-
-The template includes this by default — if pi is installed on the host, its skills are automatically available.
-
-### (c) Both
-
-Baked skills load first, then mounted skills overlay on top. Same-name skills from the mount take priority.
-
 ## Devcontainer Compliance
 
 Truman uses the [docker-compose variant](https://containers.dev/implementors/json_reference/) of the devcontainer spec:
@@ -209,15 +122,6 @@ Truman uses the [docker-compose variant](https://containers.dev/implementors/jso
 - Works with `devcontainer` CLI (`devcontainer up`, `devcontainer exec`)
 - Works with GitHub Codespaces
 - Works with DevPod
-
-## Usage
-
-See the **[template README](template/README.md)** for detailed instructions on:
-
-- [VS Code integration](template/README.md#vs-code) — open project, "Reopen in Container", full IDE experience
-- [Devcontainer CLI](template/README.md#devcontainer-cli) — `devcontainer up` / `devcontainer exec` from any terminal
-- [Docker Compose](template/README.md#docker-compose-direct) — direct `docker compose run` for scripting
-- [Customization](template/README.md#customization) — extending images, baking in skills
 
 ## Development (building truman itself)
 
