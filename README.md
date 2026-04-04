@@ -11,6 +11,13 @@ Truman provides a set of containers that give any project a secure, sandboxed AI
 
 ## Quick Start
 
+### Prerequisites
+
+- Docker Desktop
+- [pi](https://github.com/badlogic/pi-mono) installed on the host (for OAuth login)
+- For VS Code: [Dev Containers](https://marketplace.visualstudio.com/items?itemName=ms-vscode-remote.remote-containers) extension
+- For CLI: `npm install -g @devcontainers/cli` (optional)
+
 ### Add truman to your project
 
 ```bash
@@ -23,15 +30,13 @@ cd /path/to/your-project
 
 # 3. Add to .gitignore
 echo '.devcontainer/.env' >> .gitignore
-
-# 4. Open in VS Code → "Reopen in Container"
-#    Or: devcontainer up --workspace-folder .
 ```
 
-### Prerequisites
+Then start using it — see the [template README](template/README.md) for full usage instructions:
 
-- Docker Desktop
-- [pi](https://github.com/badlogic/pi-mono) installed on the host (for OAuth login)
+- **[VS Code](template/README.md#vs-code)** — "Reopen in Container" for a full IDE experience
+- **[Devcontainer CLI](template/README.md#devcontainer-cli)** — `devcontainer up` + `devcontainer exec` from any terminal
+- **[Docker Compose](template/README.md#docker-compose-direct)** — `docker compose run --rm agent` for quick interactive sessions
 
 ## Architecture
 
@@ -160,18 +165,14 @@ To add credential injection for a new API:
 2. Add real credential to `.devcontainer/.env`
 3. Add dummy value to `.devcontainer/.env.agent`
 
-## CLI Usage (without IDE)
+## Usage
 
-```bash
-# Interactive pi session
-docker compose -f .devcontainer/docker-compose.yml run --rm agent
+See the **[template README](template/README.md)** for detailed instructions on:
 
-# Single prompt
-docker compose -f .devcontainer/docker-compose.yml run --rm agent pi -p "tell me a joke"
-
-# Shell into agent
-docker compose -f .devcontainer/docker-compose.yml run --rm agent bash
-```
+- [VS Code integration](template/README.md#vs-code) — open project, "Reopen in Container", full IDE experience
+- [Devcontainer CLI](template/README.md#devcontainer-cli) — `devcontainer up` / `devcontainer exec` from any terminal
+- [Docker Compose](template/README.md#docker-compose-direct) — direct `docker compose run` for scripting
+- [Customization](template/README.md#customization) — extending images, baking in skills
 
 ## Development (building truman itself)
 
