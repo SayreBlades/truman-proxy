@@ -8,30 +8,26 @@ Copy the `.devcontainer/` directory into your project to get a sandboxed pi agen
 # 1. Copy .devcontainer/ into your project
 cp -r .devcontainer/ /path/to/your-project/.devcontainer/
 
-# 2. Sync your Anthropic credentials
+# 2. Run the interactive setup wizard
 cd /path/to/your-project
-.devcontainer/sync-token.sh
+.devcontainer/truman.sh init
 
-# 3. (Optional) Add Brave/GitHub keys
-#    Edit .devcontainer/.env
-
-# 4. Add to .gitignore
-echo '.devcontainer/.env' >> .gitignore
+# 3. Start the devcontainer
+.devcontainer/truman.sh start
 ```
 
 Then start using truman via [VS Code](#vs-code) or the [devcontainer CLI](#devcontainer-cli).
 
 ## What's Included
 
-| File                 | Purpose                           | Git status    |
-|----------------------|-----------------------------------|---------------|
-| `devcontainer.json`  | VS Code / devcontainer CLI config | Commit        |
-| `docker-compose.yml` | Gateway + agent container setup   | Commit        |
-| `.env.agent`         | Dummy API keys (safe)             | Commit        |
-| `.env.example`       | Template for real credentials     | Commit        |
-| `.env`               | Your real API keys                | **Gitignore** |
-| `setup.sh`           | Pre-flight credential check       | Commit        |
-| `sync-token.sh`      | Extract token from host pi        | Commit        |
+| File                  | Purpose                           | Git status    |
+|-----------------------|-----------------------------------|---------------|
+| `devcontainer.json`   | VS Code / devcontainer CLI config | Commit        |
+| `docker-compose.yml`  | Gateway + agent container setup   | Commit        |
+| `truman.sh`           | Setup wizard + lifecycle commands | Commit        |
+| `gateway.yaml`        | Your credentials + rules          | **Generated** |
+| `.env.agent`          | Dummy API keys for agent          | **Generated** |
+| `.env`                | Host paths for docker-compose     | **Generated** |
 
 ## VS Code
 
@@ -164,8 +160,10 @@ Both share the same workspace and run simultaneously.
 ```
 .devcontainer/
 ├── docker-compose.yml        # Shared: gateway + agent + dev (3 services)
-├── .env                      # Real secrets (gitignored)
-├── .env.agent                # Dummy keys (committed)
+├── truman.sh                 # Setup wizard + lifecycle commands
+├── gateway.yaml              # Real secrets (generated, gitignored)
+├── .env.agent                # Dummy keys (generated, gitignored)
+├── .env                      # Host paths (generated, gitignored)
 ├── agent/
 │   └── devcontainer.json     # Attaches to "agent" — sandboxed
 └── dev/
@@ -178,10 +176,9 @@ Both share the same workspace and run simultaneously.
 services:
   gateway:
     image: ghcr.io/sayreblades/truman-gateway:latest
-    env_file:
-      - path: .env
-        required: false
     volumes:
+      - ./gateway.yaml:/etc/gateway/gateway.yaml:ro
+      - ${PI_AUTH_JSON:-/dev/null}:/host-auth/auth.json
       - gateway-data:/data
     networks: [sandbox, egress]
     healthcheck:
@@ -195,7 +192,7 @@ services:
     image: ghcr.io/sayreblades/truman-agent:latest
     volumes:
       - ..:/workspace
-      - /dev/null:/workspace/.devcontainer/.env:ro
+      - /dev/null:/workspace/.devcontainer/gateway.yaml:ro
       - pi-data:/home/pi/.pi/agent
       - ~/.pi/agent/skills:/opt/pi-custom/skills:ro
       - ~/.pi/agent/prompts:/opt/pi-custom/prompts:ro

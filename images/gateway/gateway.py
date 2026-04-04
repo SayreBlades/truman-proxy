@@ -8,7 +8,8 @@ else, and forwards plain HTTP as-is.
 Uses raw asyncio for the proxy server (needed for CONNECT / TLS upgrade)
 and aiohttp ClientSession for upstream HTTPS requests.
 
-See docs/plan-phase-2.md for full design.
+Configuration is loaded from a YAML file (gateway.yaml) that declares
+per-host interception rules and credentials.
 """
 
 from __future__ import annotations
@@ -20,15 +21,16 @@ import json as json_mod
 import logging
 import os
 import queue as queue_mod
-import re
 import socket as socket_mod
 import ssl
 import tempfile
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
 import aiohttp
+import yaml
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
@@ -43,37 +45,132 @@ logging.basicConfig(
 )
 log = logging.getLogger("gateway")
 
-# ── Anthropic OAuth Token Manager ────────────────────────────────────
+# ── Configuration ────────────────────────────────────────────────────
 
-ANTHROPIC_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
-ANTHROPIC_TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
+CONFIG_PATH = Path(os.environ.get("GATEWAY_CONFIG", "/etc/gateway/gateway.yaml"))
+CA_DIR = Path(os.environ.get("CA_DIR", "/data"))
+
 # Refresh 5 minutes before actual expiry
 TOKEN_REFRESH_MARGIN_S = 5 * 60
 
+# ── Well-known OAuth Provider Registry ───────────────────────────────
+# Protocol details only — no user credentials.
 
-class AnthropicTokenManager:
-    """Manages Anthropic OAuth access tokens via refresh token.
+OAUTH_PROVIDERS: dict[str, dict] = {
+    "anthropic": {
+        "token_url": "https://platform.claude.com/v1/oauth/token",
+        "client_id": "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
+        "content_type": "json",
+    },
+}
 
-    Holds a long-lived refresh token (from .env) and uses it to obtain
-    short-lived access tokens.  Tokens are refreshed proactively before
-    expiry and reactively on 401 responses.
 
-    The latest refresh token is persisted to disk so that gateway restarts
-    survive token rotation (Anthropic invalidates old refresh tokens when
-    issuing new ones).
+# ── Generic OAuth Token Manager ──────────────────────────────────────
+
+class OAuthTokenManager:
+    """Generic OAuth2 refresh_token grant manager.
+
+    Works with any provider that supports the refresh_token grant type.
+    Protocol details (token_url, client_id, content_type) come from config
+    or the built-in provider registry.
+
+    Supports an optional shared token file (e.g. pi's auth.json) so that
+    the gateway and host tools share a single access token instead of
+    stomping each other with competing refreshes.  When token_file is set:
+
+      - On startup: read access token + expiry from the file (no refresh)
+      - On request: use cached token if valid, else re-read file, else refresh
+      - On refresh: write new tokens back so the host picks them up
     """
 
-    def __init__(self, refresh_token: str) -> None:
-        # Try to load a previously-persisted (rotated) token first
-        persisted = self._load_persisted()
-        if persisted:
-            log.info("Loaded persisted refresh token from %s", self._token_path())
-            self._refresh_token = persisted
-        else:
-            self._refresh_token = refresh_token
-        self._access_token: Optional[str] = None
-        self._expires_at: float = 0  # unix timestamp (seconds)
+    def __init__(
+        self,
+        hostname: str,
+        *,
+        token_url: str,
+        client_id: str,
+        refresh_token: str,
+        content_type: str = "json",
+        client_secret: str | None = None,
+        scope: str | None = None,
+        token_file: str | None = None,
+        token_file_key: str | None = None,
+    ) -> None:
+        self.hostname = hostname
+        self.token_url = token_url
+        self.client_id = client_id
+        self.content_type = content_type
+        self.client_secret = client_secret
+        self.scope = scope
+
+        # Shared token file support
+        self._token_file = Path(token_file) if token_file else None
+        self._token_file_key = token_file_key
+
+        # Initialize tokens — prefer shared file, then persisted, then config
+        self._refresh_token = refresh_token
+        self._access_token: str | None = None
+        self._expires_at: float = 0
         self._lock = asyncio.Lock()
+
+        # Try loading from shared token file first
+        if self._token_file:
+            loaded = self._read_token_file()
+            if loaded:
+                self._access_token = loaded.get("access")
+                self._refresh_token = loaded.get("refresh", self._refresh_token)
+                expires_ms = loaded.get("expires", 0)
+                if expires_ms:
+                    self._expires_at = (expires_ms / 1000) - TOKEN_REFRESH_MARGIN_S
+        else:
+            # Fall back to gateway's own persisted refresh token
+            persisted_rt = self._load_persisted_refresh()
+            if persisted_rt:
+                self._refresh_token = persisted_rt
+
+    def _read_token_file(self) -> dict | None:
+        """Read token data from the shared token file."""
+        if not self._token_file or not self._token_file_key:
+            return None
+        try:
+            if not self._token_file.exists():
+                return None
+            data = json_mod.loads(self._token_file.read_text())
+            entry = data.get(self._token_file_key)
+            if entry and isinstance(entry, dict):
+                return entry
+        except Exception as exc:
+            log.warning(
+                "Failed to read token file %s[%s]: %s",
+                self._token_file, self._token_file_key, exc,
+            )
+        return None
+
+    def _write_token_file(self) -> None:
+        """Write current tokens back to the shared token file."""
+        if not self._token_file or not self._token_file_key:
+            return
+        try:
+            # Read existing file, update our key, write back
+            if self._token_file.exists():
+                data = json_mod.loads(self._token_file.read_text())
+            else:
+                data = {}
+            data[self._token_file_key] = {
+                "type": "oauth",
+                "access": self._access_token,
+                "refresh": self._refresh_token,
+                "expires": int(
+                    (self._expires_at + TOKEN_REFRESH_MARGIN_S) * 1000
+                ),
+            }
+            self._token_file.write_text(json_mod.dumps(data, indent=4))
+            log.info("Wrote tokens back to %s[%s]",
+                     self._token_file, self._token_file_key)
+        except Exception as exc:
+            log.warning(
+                "Failed to write token file %s: %s", self._token_file, exc,
+            )
 
     async def get_access_token(self, http_session: aiohttp.ClientSession) -> str:
         """Return a valid access token, refreshing if necessary."""
@@ -82,172 +179,314 @@ class AnthropicTokenManager:
         return await self._refresh(http_session)
 
     async def force_refresh(self, http_session: aiohttp.ClientSession) -> str:
-        """Force a token refresh (e.g. after a 401)."""
+        """Force a token refresh (e.g. after a 401).
+
+        If using a shared token file, re-read it first — the host may have
+        already refreshed.  Only do a real refresh if the file token is also
+        stale.
+        """
+        async with self._lock:
+            # Re-read shared file — host may have refreshed
+            if self._token_file:
+                loaded = self._read_token_file()
+                if loaded:
+                    new_access = loaded.get("access")
+                    new_expires_ms = loaded.get("expires", 0)
+                    new_expires_at = (new_expires_ms / 1000) - TOKEN_REFRESH_MARGIN_S
+                    # If the file has a different, still-valid token, use it
+                    if (new_access
+                            and new_access != self._access_token
+                            and time.time() < new_expires_at):
+                        log.info(
+                            "Picked up refreshed token from file for %s",
+                            self.hostname,
+                        )
+                        self._access_token = new_access
+                        self._expires_at = new_expires_at
+                        if loaded.get("refresh"):
+                            self._refresh_token = loaded["refresh"]
+                        return self._access_token
+
+        # File didn't help — do a real refresh
         return await self._refresh(http_session)
 
     async def _refresh(self, http_session: aiohttp.ClientSession) -> str:
         async with self._lock:
-            # Double-check after acquiring lock (another coroutine may have refreshed)
-            if self._access_token and time.time() < self._expires_at:
+            # Double-check: re-read shared file under lock
+            if self._token_file:
+                loaded = self._read_token_file()
+                if loaded:
+                    new_access = loaded.get("access")
+                    new_expires_ms = loaded.get("expires", 0)
+                    new_expires_at = (new_expires_ms / 1000) - TOKEN_REFRESH_MARGIN_S
+                    if new_access and time.time() < new_expires_at:
+                        self._access_token = new_access
+                        self._expires_at = new_expires_at
+                        if loaded.get("refresh"):
+                            self._refresh_token = loaded["refresh"]
+                        log.info(
+                            "Using token from shared file for %s (expires in %ds)",
+                            self.hostname,
+                            int(new_expires_at + TOKEN_REFRESH_MARGIN_S - time.time()),
+                        )
+                        return self._access_token
+            elif self._access_token and time.time() < self._expires_at:
+                # Without token file: simple double-check after lock
                 return self._access_token
 
-            log.info("Refreshing Anthropic OAuth access token...")
-            async with http_session.post(
-                ANTHROPIC_TOKEN_URL,
-                json={
-                    "grant_type": "refresh_token",
-                    "client_id": ANTHROPIC_CLIENT_ID,
-                    "refresh_token": self._refresh_token,
-                },
-                headers={
-                    "Content-Type": "application/json",
-                    "Accept": "application/json",
-                },
-            ) as resp:
-                body = await resp.text()
+            log.info("Refreshing OAuth token for %s ...", self.hostname)
+
+            body = {
+                "grant_type": "refresh_token",
+                "client_id": self.client_id,
+                "refresh_token": self._refresh_token,
+            }
+            if self.client_secret:
+                body["client_secret"] = self.client_secret
+            if self.scope:
+                body["scope"] = self.scope
+
+            if self.content_type == "json":
+                kwargs = {
+                    "json": body,
+                    "headers": {
+                        "Content-Type": "application/json",
+                        "Accept": "application/json",
+                    },
+                }
+            else:  # form
+                kwargs = {
+                    "data": body,
+                    "headers": {
+                        "Accept": "application/json",
+                    },
+                }
+
+            async with http_session.post(self.token_url, **kwargs) as resp:
+                resp_body = await resp.text()
                 if not resp.ok:
-                    log.error("Token refresh failed: %d %s", resp.status, body)
-                    raise RuntimeError(f"Anthropic token refresh failed: {resp.status} {body}")
-                data = json_mod.loads(body)
+                    log.error(
+                        "OAuth refresh failed for %s: %d %s",
+                        self.hostname, resp.status, resp_body,
+                    )
+                    raise RuntimeError(
+                        f"OAuth refresh failed for {self.hostname}: "
+                        f"{resp.status} {resp_body}"
+                    )
+                data = json_mod.loads(resp_body)
 
             self._access_token = data["access_token"]
             expires_in = data.get("expires_in", 3600)
             self._expires_at = time.time() + expires_in - TOKEN_REFRESH_MARGIN_S
-            # Update and persist refresh token if rotated
+
             if data.get("refresh_token"):
                 self._refresh_token = data["refresh_token"]
-                self._persist()
-            log.info("Anthropic OAuth token refreshed (expires in %ds)", expires_in)
+
+            # Write back to shared file or gateway's own persistence
+            if self._token_file:
+                self._write_token_file()
+            else:
+                self._persist_refresh()
+
+            log.info(
+                "OAuth token refreshed for %s (expires in %ds)",
+                self.hostname, expires_in,
+            )
             return self._access_token
 
-    @staticmethod
-    def _token_path() -> Path:
-        return Path(os.environ.get("CA_DIR", "/data")) / "anthropic_token.json"
+    # ── Gateway-local persistence (used when no token_file) ──────
 
-    def _persist(self) -> None:
+    def _persist_path(self) -> Path:
+        return CA_DIR / "oauth" / f"{self.hostname}.json"
+
+    def _persist_refresh(self) -> None:
         """Save the current refresh token to disk for restart survival."""
         try:
-            p = self._token_path()
+            p = self._persist_path()
             p.parent.mkdir(parents=True, exist_ok=True)
             p.write_text(json_mod.dumps({"refresh_token": self._refresh_token}))
-            log.info("Persisted rotated refresh token to %s", p)
+            log.info("Persisted rotated refresh token for %s", self.hostname)
         except Exception as exc:
-            log.warning("Failed to persist refresh token: %s", exc)
+            log.warning("Failed to persist refresh token for %s: %s",
+                        self.hostname, exc)
 
-    @staticmethod
-    def _load_persisted() -> Optional[str]:
+    def _load_persisted_refresh(self) -> str | None:
         """Load a previously-persisted refresh token, if any."""
         try:
-            p = AnthropicTokenManager._token_path()
+            p = self._persist_path()
             if p.exists():
                 data = json_mod.loads(p.read_text())
-                return data.get("refresh_token")
+                rt = data.get("refresh_token")
+                if rt:
+                    log.info("Loaded persisted refresh token for %s",
+                             self.hostname)
+                    return rt
         except Exception as exc:
-            log.warning("Failed to load persisted token: %s", exc)
+            log.warning("Failed to load persisted token for %s: %s",
+                        self.hostname, exc)
         return None
 
+    def validate(self) -> list[str]:
+        """Validate configuration at startup. Returns list of issues."""
+        issues: list[str] = []
 
-# Initialized at startup if ANTHROPIC_REFRESH_TOKEN is set
-_anthropic_token_mgr: Optional[AnthropicTokenManager] = None
-
-
-# ── Credential injection rules ───────────────────────────────────────
-
-INTERCEPT_RULES: dict[str, dict] = {
-    "api.anthropic.com": {
-        "strip_headers": ["authorization", "x-api-key"],
-        "inject_headers": {
-            "Authorization": "Bearer {ANTHROPIC_OAUTH_TOKEN}",
-            "X-Api-Key": "{ANTHROPIC_API_KEY}",
-        },
-    },
-    "api.search.brave.com": {
-        "strip_headers": ["x-subscription-token"],
-        "inject_headers": {
-            "X-Subscription-Token": "{BRAVE_API_KEY}",
-        },
-    },
-    "api.github.com": {
-        "strip_headers": ["authorization"],
-        "inject_headers": {
-            "Authorization": "token {GH_TOKEN}",
-        },
-    },
-    "github.com": {
-        "strip_headers": ["authorization"],
-        "inject_headers": {
-            "Authorization": "basic {GH_TOKEN}",
-        },
-    },
-}
-
-# Resolved at startup
-RESOLVED_RULES: dict[str, dict] = {}
-
-# ── Resolve rules from env ───────────────────────────────────────────
-
-
-def resolve_rules() -> dict[str, dict]:
-    """Resolve env-var placeholders in inject_headers at startup.
-
-    For ANTHROPIC_OAUTH_TOKEN: if ANTHROPIC_REFRESH_TOKEN is set, the
-    header value is resolved dynamically at request time (marked with a
-    sentinel).  Otherwise falls back to a static token from env.
-    """
-    resolved: dict[str, dict] = {}
-    for host, rule in INTERCEPT_RULES.items():
-        inject: dict[str, str] = {}
-        for header, template in rule["inject_headers"].items():
-            # Extract var name from e.g. "Bearer {ANTHROPIC_OAUTH_TOKEN}"
-            match = re.search(r"\{(\w+)\}", template)
-            if not match:
-                continue
-            var = match.group(1)
-
-            # Dynamic OAuth: if we have a refresh token manager for this var,
-            # mark the header for dynamic resolution at request time
-            if var == "ANTHROPIC_OAUTH_TOKEN" and _anthropic_token_mgr is not None:
-                inject[header] = "__DYNAMIC_ANTHROPIC_OAUTH__"
-                log.info("  %s: %s → will inject %s (dynamic refresh)", host, var, header)
-                continue
-
-            value = os.environ.get(var)
-            if value:
-                # "basic {VAR}" → HTTP Basic auth (x-access-token:<token>)
-                # Used for github.com git smart-HTTP which requires Basic auth
-                if template.startswith("basic "):
-                    creds = base64.b64encode(f"x-access-token:{value}".encode()).decode()
-                    inject[header] = f"Basic {creds}"
-                else:
-                    inject[header] = template.replace(f"{{{var}}}", value)
-                log.info("  %s: %s → will inject %s", host, var, header)
+        if self._token_file:
+            if not self._token_file.exists():
+                issues.append(
+                    f"token_file '{self._token_file}' does not exist"
+                )
+            elif not self._token_file_key:
+                issues.append("token_file set but token_file_key is missing")
             else:
-                log.info("  %s: %s not set, skipping %s", host, var, header)
-        resolved[host] = {
-            "strip_headers": set(h.lower() for h in rule["strip_headers"]),
-            "inject_headers": inject,
-        }
+                loaded = self._read_token_file()
+                if loaded is None:
+                    issues.append(
+                        f"token_file_key '{self._token_file_key}' not found "
+                        f"in {self._token_file}"
+                    )
+                else:
+                    if not loaded.get("access"):
+                        issues.append(
+                            f"no access token in "
+                            f"{self._token_file}[{self._token_file_key}]"
+                        )
+                    if not loaded.get("refresh"):
+                        issues.append(
+                            f"no refresh token in "
+                            f"{self._token_file}[{self._token_file_key}]"
+                        )
+                    expires_ms = loaded.get("expires", 0)
+                    if expires_ms:
+                        remaining_s = (expires_ms / 1000) - time.time()
+                        if remaining_s <= 0:
+                            issues.append(
+                                f"access token in "
+                                f"{self._token_file}[{self._token_file_key}] "
+                                f"is expired (will refresh on first request)"
+                            )
+                        elif remaining_s < TOKEN_REFRESH_MARGIN_S:
+                            issues.append(
+                                f"access token in "
+                                f"{self._token_file}[{self._token_file_key}] "
+                                f"expires in {int(remaining_s)}s "
+                                f"(will refresh on first request)"
+                            )
+        return issues
+
+
+# ── Host Rule & Config Parsing ───────────────────────────────────────
+
+@dataclass
+class HostRule:
+    strip_headers: set[str]             # lowercased header names to remove
+    inject_templates: dict[str, str]    # header templates with $VARIABLE placeholders
+    rule_type: str                      # "apikey" or "oauth"
+    api_key: str | None = None          # for type: apikey
+    oauth_manager: OAuthTokenManager | None = None  # for type: oauth
+
+
+def parse_host_rule(hostname: str, cfg: dict) -> HostRule:
+    """Parse a single host rule from config."""
+    rule_type = cfg["type"]
+    strip = set(h.lower() for h in cfg.get("strip_headers", []))
+    inject = cfg.get("inject_headers", {})
+
+    if rule_type == "apikey":
+        api_key = cfg["api_key"]
+        return HostRule(strip, inject, rule_type, api_key=api_key)
+
+    elif rule_type == "oauth":
+        # Resolve provider defaults, then apply explicit overrides
+        provider_name = cfg.get("provider")
+        provider_defaults = (
+            OAUTH_PROVIDERS.get(provider_name, {}) if provider_name else {}
+        )
+
+        token_url = cfg.get("token_url", provider_defaults.get("token_url"))
+        client_id = cfg.get("client_id", provider_defaults.get("client_id"))
+        content_type = cfg.get(
+            "content_type", provider_defaults.get("content_type", "json"),
+        )
+
+        if not token_url or not client_id:
+            raise ValueError(
+                f"OAuth rule for {hostname}: must specify 'provider' or "
+                f"'token_url' + 'client_id'"
+            )
+
+        mgr = OAuthTokenManager(
+            hostname,
+            token_url=token_url,
+            client_id=client_id,
+            refresh_token=cfg.get("refresh_token", ""),
+            content_type=content_type,
+            client_secret=cfg.get("client_secret"),
+            scope=cfg.get("scope"),
+            token_file=cfg.get("token_file"),
+            token_file_key=cfg.get("token_file_key"),
+        )
+        return HostRule(strip, inject, rule_type, oauth_manager=mgr)
+
+    else:
+        raise ValueError(f"Unknown rule type '{rule_type}' for {hostname}")
+
+
+def load_config() -> dict[str, HostRule]:
+    """Load and validate gateway configuration from YAML."""
+    raw = yaml.safe_load(CONFIG_PATH.read_text())
+    if not raw:
+        log.warning("Empty gateway config — no hosts will be intercepted")
+        return {}
+    rules = {}
+    for hostname, cfg in raw.items():
+        rules[hostname] = parse_host_rule(hostname, cfg)
+    return rules
+
+
+# ── Header Resolution ────────────────────────────────────────────────
+
+async def resolve_headers(
+    rule: HostRule,
+    http_session: aiohttp.ClientSession,
+) -> dict[str, str]:
+    """Resolve $VARIABLE placeholders in inject_headers to real values."""
+
+    if rule.rule_type == "apikey":
+        credential = rule.api_key
+    elif rule.rule_type == "oauth":
+        credential = await rule.oauth_manager.get_access_token(http_session)
+    else:
+        return {}
+
+    # Compute $BASIC_AUTH
+    basic_auth = base64.b64encode(
+        f"x-access-token:{credential}".encode()
+    ).decode()
+
+    replacements = {
+        "$API_KEY": credential if rule.rule_type == "apikey" else "",
+        "$ACCESS_TOKEN": credential if rule.rule_type == "oauth" else "",
+        "$BASIC_AUTH": basic_auth,
+    }
+
+    resolved = {}
+    for header, template in rule.inject_templates.items():
+        value = template
+        for var, replacement in replacements.items():
+            value = value.replace(var, replacement)
+        resolved[header] = value
+
     return resolved
 
 
-async def resolve_dynamic_headers(
-    headers: dict[str, str],
-    http_session: aiohttp.ClientSession,
-) -> dict[str, str]:
-    """Replace dynamic sentinel values with live tokens."""
-    if not _anthropic_token_mgr:
-        return headers
-    result = dict(headers)
-    for key, value in result.items():
-        if value == "__DYNAMIC_ANTHROPIC_OAUTH__":
-            token = await _anthropic_token_mgr.get_access_token(http_session)
-            result[key] = f"Bearer {token}"
-    return result
+# ── Global state ─────────────────────────────────────────────────────
+
+_rules: dict[str, HostRule] = {}
+_http_session: Optional[aiohttp.ClientSession] = None
 
 
 # ── CA Manager ───────────────────────────────────────────────────────
 
-CA_DIR = Path(os.environ.get("CA_DIR", "/data"))
 CA_KEY_PATH = CA_DIR / "ca.key"
 CA_CERT_PATH = CA_DIR / "ca.pem"
 
@@ -283,7 +522,9 @@ def load_or_generate_ca() -> tuple[rsa.RSAPrivateKey, x509.Certificate]:
         .serial_number(x509.random_serial_number())
         .not_valid_before(now - datetime.timedelta(days=1))
         .not_valid_after(now + datetime.timedelta(days=3650))
-        .add_extension(x509.BasicConstraints(ca=True, path_length=0), critical=True)
+        .add_extension(
+            x509.BasicConstraints(ca=True, path_length=0), critical=True,
+        )
         .add_extension(
             x509.KeyUsage(
                 digital_signature=True, key_cert_sign=True, crl_sign=True,
@@ -320,7 +561,9 @@ def generate_host_cert(hostname: str) -> tuple[bytes, bytes]:
     now = datetime.datetime.now(datetime.UTC)
     host_cert = (
         x509.CertificateBuilder()
-        .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, hostname)]))
+        .subject_name(
+            x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, hostname)]),
+        )
         .issuer_name(_ca_cert.subject)
         .public_key(host_key.public_key())
         .serial_number(x509.random_serial_number())
@@ -351,7 +594,6 @@ def generate_host_cert(hostname: str) -> tuple[bytes, bytes]:
 def make_server_ssl_context(cert_pem: bytes, key_pem: bytes) -> ssl.SSLContext:
     """Build an SSLContext for the server side of a MITM connection."""
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    # Only offer HTTP/1.1 — we don't implement HTTP/2 framing
     ctx.set_alpn_protocols(["http/1.1"])
     with tempfile.NamedTemporaryFile(delete=False, suffix=".crt") as cf, \
          tempfile.NamedTemporaryFile(delete=False, suffix=".key") as kf:
@@ -380,7 +622,9 @@ async def blind_tunnel(
 ) -> None:
     """Bidirectional TCP pipe."""
 
-    async def relay(src: asyncio.StreamReader, dst: asyncio.StreamWriter) -> None:
+    async def relay(
+        src: asyncio.StreamReader, dst: asyncio.StreamWriter,
+    ) -> None:
         try:
             while True:
                 data = await src.read(RELAY_BUF)
@@ -388,7 +632,10 @@ async def blind_tunnel(
                     break
                 dst.write(data)
                 await dst.drain()
-        except (ConnectionResetError, BrokenPipeError, asyncio.CancelledError, OSError):
+        except (
+            ConnectionResetError, BrokenPipeError,
+            asyncio.CancelledError, OSError,
+        ):
             pass
         finally:
             try:
@@ -410,16 +657,14 @@ async def mitm_proxy(
     client_writer: asyncio.StreamWriter,
     hostname: str,
     port: int,
-    rule: dict,
+    rule: HostRule,
     http_session: aiohttp.ClientSession,
 ) -> None:
     """Terminate TLS as the MITM, read HTTP, inject creds, forward upstream."""
 
-    # Generate host cert, upgrade connection to TLS (server-side)
     cert_pem, key_pem = generate_host_cert(hostname)
     ssl_ctx = make_server_ssl_context(cert_pem, key_pem)
 
-    # Get the raw socket, dup it, and detach from asyncio
     transport = client_writer.transport
     raw_sock = transport.get_extra_info("socket")
     if raw_sock is None:
@@ -427,29 +672,25 @@ async def mitm_proxy(
         return
 
     fd = os.dup(raw_sock.fileno())
-    transport.abort()  # close transport without closing socket (we duped fd)
+    transport.abort()
 
     duped_sock = socket_mod.socket(fileno=fd)
-
-    # Do the TLS handshake in a thread (blocking)
     duped_sock.setblocking(True)
     loop = asyncio.get_event_loop()
     ssl_sock = await loop.run_in_executor(
         None, lambda: ssl_ctx.wrap_socket(duped_sock, server_side=True),
     )
 
-    # Use blocking I/O in a thread for the entire MITM session
     await loop.run_in_executor(
         None, _mitm_sync, ssl_sock, hostname, port, rule, loop, http_session,
     )
-    return
 
 
 def _mitm_sync(
     ssl_sock,
     hostname: str,
     port: int,
-    rule: dict,
+    rule: HostRule,
     loop: asyncio.AbstractEventLoop,
     http_session: aiohttp.ClientSession,
 ) -> None:
@@ -460,7 +701,7 @@ def _mitm_sync(
     Streams response chunks back to the client for SSE support.
     """
     ssl_sock.settimeout(300)
-    rfile = ssl_sock.makefile("rb")  # default buffering — ensures read(n) returns exactly n bytes
+    rfile = ssl_sock.makefile("rb")
 
     try:
         # Read HTTP request line
@@ -494,33 +735,41 @@ def _mitm_sync(
 
         # Build outgoing headers: strip dummies, inject real creds
         out_headers: dict[str, str] = {}
-        strip_set = rule["strip_headers"]
         for key, value in raw_headers:
-            if key.lower() not in strip_set:
+            if key.lower() not in rule.strip_headers:
                 out_headers[key] = value
 
-        for key, value in rule["inject_headers"].items():
+        # Resolve $VARIABLE templates to real credential values
+        future = asyncio.run_coroutine_threadsafe(
+            resolve_headers(rule, http_session), loop,
+        )
+        resolved_inject = future.result(timeout=30)
+
+        for key, value in resolved_inject.items():
             out_headers[key] = value
 
-        # Resolve dynamic tokens (e.g. OAuth access tokens from refresh flow)
-        future = asyncio.run_coroutine_threadsafe(
-            resolve_dynamic_headers(out_headers, http_session), loop,
-        )
-        out_headers = future.result(timeout=30)
-
-        # Remove hop-by-hop + Accept-Encoding (so upstream sends uncompressed;
-        # avoids gzip mismatch since aiohttp auto-decompresses)
+        # Remove hop-by-hop + Accept-Encoding
         for hdr in list(out_headers.keys()):
-            if hdr.lower() in ("proxy-connection", "proxy-authorization", "accept-encoding"):
+            if hdr.lower() in (
+                "proxy-connection", "proxy-authorization", "accept-encoding",
+            ):
                 del out_headers[hdr]
 
-        url = f"https://{hostname}{path}" if port == 443 else f"https://{hostname}:{port}{path}"
-        log.info("MITM %s %s (body: %s bytes)", method, url, len(body) if body else 0)
+        url = (
+            f"https://{hostname}{path}" if port == 443
+            else f"https://{hostname}:{port}{path}"
+        )
+        log.info(
+            "MITM %s %s (body: %s bytes)",
+            method, url, len(body) if body else 0,
+        )
 
-        # Use a thread-safe queue to stream response from async to sync
         q: queue_mod.Queue = queue_mod.Queue()
 
-        async def do_upstream(headers_to_send: dict[str, str], retry_on_401: bool = True):
+        async def do_upstream(
+            headers_to_send: dict[str, str],
+            retry_on_401: bool = True,
+        ):
             try:
                 async with http_session.request(
                     method, url,
@@ -528,20 +777,33 @@ def _mitm_sync(
                     data=body,
                     allow_redirects=False,
                 ) as resp:
-                    # On 401 with a refresh-capable token, force-refresh and retry once
-                    if resp.status == 401 and retry_on_401 and _anthropic_token_mgr:
+                    # On 401 with OAuth, force-refresh and retry once
+                    if (resp.status == 401 and retry_on_401
+                            and rule.oauth_manager):
                         resp_body = await resp.text()
-                        if "expired" in resp_body.lower() or "authentication" in resp_body.lower():
-                            log.warning("Got 401 from %s, forcing token refresh...", hostname)
-                            new_token = await _anthropic_token_mgr.force_refresh(http_session)
+                        if ("expired" in resp_body.lower()
+                                or "authentication" in resp_body.lower()):
+                            log.warning(
+                                "Got 401 from %s, forcing token refresh...",
+                                hostname,
+                            )
+                            await rule.oauth_manager.force_refresh(
+                                http_session,
+                            )
+                            refreshed_inject = await resolve_headers(
+                                rule, http_session,
+                            )
                             refreshed_headers = dict(headers_to_send)
-                            for k in refreshed_headers:
-                                if k.lower() == "authorization" and "Bearer" in refreshed_headers[k]:
-                                    refreshed_headers[k] = f"Bearer {new_token}"
-                            await do_upstream(refreshed_headers, retry_on_401=False)
+                            for k, v in refreshed_inject.items():
+                                refreshed_headers[k] = v
+                            await do_upstream(
+                                refreshed_headers, retry_on_401=False,
+                            )
                             return
-                    q.put(("headers", resp.status, resp.reason or "OK",
-                           list(resp.headers.items())))
+                    q.put((
+                        "headers", resp.status, resp.reason or "OK",
+                        list(resp.headers.items()),
+                    ))
                     async for chunk in resp.content.iter_any():
                         q.put(("data", chunk))
                     q.put(("end",))
@@ -557,10 +819,8 @@ def _mitm_sync(
         assert msg[0] == "headers"
         _, status, reason, resp_headers = msg
 
-        # Send status line
         ssl_sock.sendall(f"HTTP/1.1 {status} {reason}\r\n".encode())
 
-        # Forward response headers (skip hop-by-hop + encoding-related)
         for key, value in resp_headers:
             if key.lower() in (
                 "transfer-encoding", "connection", "keep-alive",
@@ -569,11 +829,9 @@ def _mitm_sync(
                 continue
             ssl_sock.sendall(f"{key}: {value}\r\n".encode())
 
-        # Use chunked Transfer-Encoding for streaming
         ssl_sock.sendall(b"Transfer-Encoding: chunked\r\n")
         ssl_sock.sendall(b"Connection: close\r\n\r\n")
 
-        # Stream body chunks
         total_bytes = 0
         while True:
             msg = q.get(timeout=120)
@@ -589,10 +847,12 @@ def _mitm_sync(
                     ssl_sock.sendall(chunk)
                     ssl_sock.sendall(b"\r\n")
 
-        # Chunked terminator
         ssl_sock.sendall(b"0\r\n\r\n")
 
-        log.info("MITM %s %s → %d (%d bytes streamed)", method, url, status, total_bytes)
+        log.info(
+            "MITM %s %s → %d (%d bytes streamed)",
+            method, url, status, total_bytes,
+        )
 
     except Exception as exc:
         log.error("MITM error for %s: %s", hostname, exc)
@@ -617,15 +877,13 @@ def _mitm_sync(
 
 # ── Main connection handler ──────────────────────────────────────────
 
-_http_session: Optional[aiohttp.ClientSession] = None
-
-
-async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+async def handle_client(
+    reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
+) -> None:
     """Handle one incoming proxy connection."""
     peer = writer.get_extra_info("peername")
 
     try:
-        # Read first line to determine request type
         first_line = await asyncio.wait_for(reader.readline(), timeout=30)
         if not first_line:
             writer.close()
@@ -649,40 +907,52 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                 hostname = target
                 port = 443
 
-            # Consume remaining headers (CONNECT has headers but no body)
             while True:
                 line = await reader.readline()
                 if line in (b"\r\n", b"\n", b""):
                     break
 
-            rule = RESOLVED_RULES.get(hostname)
-            if rule and rule["inject_headers"]:
+            rule = _rules.get(hostname)
+            if rule and rule.inject_templates:
                 log.info("CONNECT %s:%d → MITM", hostname, port)
-                # Send 200 Connection Established
-                writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                writer.write(
+                    b"HTTP/1.1 200 Connection Established\r\n\r\n",
+                )
                 await writer.drain()
-                # MITM the connection
                 assert _http_session is not None
-                await mitm_proxy(reader, writer, hostname, port, rule, _http_session)
+                await mitm_proxy(
+                    reader, writer, hostname, port, rule, _http_session,
+                )
             else:
                 log.info("CONNECT %s:%d → blind tunnel", hostname, port)
                 try:
-                    target_reader, target_writer = await asyncio.open_connection(hostname, port)
+                    target_reader, target_writer = (
+                        await asyncio.open_connection(hostname, port)
+                    )
                 except Exception as exc:
-                    log.error("Blind tunnel connect failed %s:%d: %s", hostname, port, exc)
-                    writer.write(f"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n".encode())
+                    log.error(
+                        "Blind tunnel connect failed %s:%d: %s",
+                        hostname, port, exc,
+                    )
+                    writer.write(
+                        b"HTTP/1.1 502 Bad Gateway\r\n"
+                        b"Content-Length: 0\r\n\r\n"
+                    )
                     await writer.drain()
                     writer.close()
                     return
 
-                writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                writer.write(
+                    b"HTTP/1.1 200 Connection Established\r\n\r\n",
+                )
                 await writer.drain()
-                await blind_tunnel(reader, writer, target_reader, target_writer)
+                await blind_tunnel(
+                    reader, writer, target_reader, target_writer,
+                )
 
         # ── GET /healthz or /ca.pem (direct to gateway) ─────────
         elif len(parts) >= 2 and parts[1] in ("/healthz", "/ca.pem"):
             path = parts[1]
-            # Consume headers
             while True:
                 line = await reader.readline()
                 if line in (b"\r\n", b"\n", b""):
@@ -705,10 +975,11 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                 await writer.drain()
 
         # ── HTTP forward proxy (absolute URL) ────────────────────
-        elif method in ("GET", "HEAD", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"):
+        elif method in (
+            "GET", "HEAD", "POST", "PUT", "DELETE", "PATCH", "OPTIONS",
+        ):
             url = parts[1]
 
-            # Read headers
             headers: list[tuple[str, str]] = []
             content_length: Optional[int] = None
             while True:
@@ -724,15 +995,15 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                     if key.lower() == "content-length":
                         content_length = int(value)
 
-            # Read body
             body: Optional[bytes] = None
             if content_length and content_length > 0:
                 body = await reader.readexactly(content_length)
 
-            # Forward headers (strip hop-by-hop)
             out_headers: dict[str, str] = {}
             for key, value in headers:
-                if key.lower() not in ("proxy-connection", "proxy-authorization", "connection"):
+                if key.lower() not in (
+                    "proxy-connection", "proxy-authorization", "connection",
+                ):
                     out_headers[key] = value
 
             log.info("HTTP %s %s", method, url)
@@ -745,10 +1016,15 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                     data=body,
                     allow_redirects=False,
                 ) as upstream_resp:
-                    resp_line = f"HTTP/1.1 {upstream_resp.status} {upstream_resp.reason or 'OK'}\r\n"
+                    resp_line = (
+                        f"HTTP/1.1 {upstream_resp.status} "
+                        f"{upstream_resp.reason or 'OK'}\r\n"
+                    )
                     writer.write(resp_line.encode())
                     for key, value in upstream_resp.headers.items():
-                        if key.lower() not in ("transfer-encoding", "connection"):
+                        if key.lower() not in (
+                            "transfer-encoding", "connection",
+                        ):
                             writer.write(f"{key}: {value}\r\n".encode())
                     writer.write(b"Transfer-Encoding: chunked\r\n\r\n")
                     await writer.drain()
@@ -766,15 +1042,23 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                 log.error("HTTP forward error: %s", exc)
                 err = f"Gateway error: {exc}".encode()
                 writer.write(b"HTTP/1.1 502 Bad Gateway\r\n")
-                writer.write(f"Content-Length: {len(err)}\r\n\r\n".encode())
+                writer.write(
+                    f"Content-Length: {len(err)}\r\n\r\n".encode(),
+                )
                 writer.write(err)
                 await writer.drain()
 
         else:
-            writer.write(b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\n\r\n")
+            writer.write(
+                b"HTTP/1.1 405 Method Not Allowed\r\n"
+                b"Content-Length: 0\r\n\r\n"
+            )
             await writer.drain()
 
-    except (ConnectionResetError, BrokenPipeError, asyncio.CancelledError, OSError) as exc:
+    except (
+        ConnectionResetError, BrokenPipeError,
+        asyncio.CancelledError, OSError,
+    ) as exc:
         log.debug("Connection error from %s: %s", peer, exc)
     except Exception as exc:
         log.error("Unhandled error from %s: %s", peer, exc, exc_info=True)
@@ -790,20 +1074,53 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
 # ── Main ─────────────────────────────────────────────────────────────
 
 async def main() -> None:
-    global _ca_key, _ca_cert, _http_session, RESOLVED_RULES, _anthropic_token_mgr
+    global _ca_key, _ca_cert, _http_session, _rules
 
     log.info("Starting secret gateway...")
+    log.info("Loading config from %s", CONFIG_PATH)
 
-    # ── Initialize Anthropic OAuth token manager (if refresh token set) ──
-    refresh_token = os.environ.get("ANTHROPIC_REFRESH_TOKEN")
-    if refresh_token:
-        log.info("ANTHROPIC_REFRESH_TOKEN set → enabling OAuth auto-refresh")
-        _anthropic_token_mgr = AnthropicTokenManager(refresh_token)
-    else:
-        log.info("ANTHROPIC_REFRESH_TOKEN not set → using static credentials")
+    _rules = load_config()
 
-    log.info("Resolving credential injection rules:")
-    RESOLVED_RULES = resolve_rules()
+    log.info("Loaded rules for %d hosts:", len(_rules))
+    for hostname, rule in _rules.items():
+        log.info(
+            "  %s: type=%s, strip=%s, inject=%s",
+            hostname, rule.rule_type,
+            rule.strip_headers,
+            list(rule.inject_templates.keys()),
+        )
+
+    # ── Validate OAuth configurations ────────────────────────────
+    startup_ok = True
+    for hostname, rule in _rules.items():
+        if rule.oauth_manager:
+            issues = rule.oauth_manager.validate()
+            if issues:
+                for issue in issues:
+                    # "expired" / "expires in" are warnings, rest are errors
+                    if "expire" in issue.lower() or "will refresh" in issue.lower():
+                        log.warning("  %s: %s", hostname, issue)
+                    else:
+                        log.error("  %s: %s", hostname, issue)
+                        startup_ok = False
+            else:
+                mgr = rule.oauth_manager
+                if mgr._token_file:
+                    remaining = mgr._expires_at + TOKEN_REFRESH_MARGIN_S - time.time()
+                    log.info(
+                        "  %s: token_file OK (%s[%s], "
+                        "token expires in %.0fh)",
+                        hostname, mgr._token_file,
+                        mgr._token_file_key,
+                        remaining / 3600,
+                    )
+                else:
+                    log.info("  %s: standalone OAuth (no shared token file)",
+                             hostname)
+
+    if not startup_ok:
+        log.error("Startup validation failed — fix errors above")
+        raise SystemExit(1)
 
     _ca_key, _ca_cert = load_or_generate_ca()
 
@@ -811,18 +1128,31 @@ async def main() -> None:
         connector=aiohttp.TCPConnector(
             ssl=True,
             limit=100,
-            force_close=True,  # Don't reuse connections — avoids stale keepalive
+            force_close=True,
         ),
     )
 
-    # ── Pre-fetch initial access token so first request isn't slow ──
-    if _anthropic_token_mgr:
-        try:
-            await _anthropic_token_mgr.get_access_token(_http_session)
-            log.info("Initial Anthropic access token acquired")
-        except Exception as exc:
-            log.error("Failed to acquire initial Anthropic token: %s", exc)
-            log.error("Requests to api.anthropic.com will fail until refresh succeeds")
+    # Pre-fetch OAuth tokens (only refreshes if needed — shared file
+    # tokens that are still valid will be used as-is)
+    for hostname, rule in _rules.items():
+        if rule.oauth_manager:
+            try:
+                token = await rule.oauth_manager.get_access_token(
+                    _http_session,
+                )
+                log.info(
+                    "OAuth token ready for %s (prefix: %s...)",
+                    hostname, token[:20],
+                )
+            except Exception as exc:
+                log.error(
+                    "Failed to acquire initial token for %s: %s",
+                    hostname, exc,
+                )
+                log.error(
+                    "Requests to %s will fail until refresh succeeds",
+                    hostname,
+                )
 
     server = await asyncio.start_server(handle_client, "0.0.0.0", 8080)
 

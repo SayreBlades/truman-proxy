@@ -1,7 +1,7 @@
-# Secrets — never commit (.env.agent and .env.example are safe)
-.env
-!.env.agent
-!.env.example
+# Secrets & generated config — never commit
+.devcontainer/gateway.yaml
+.devcontainer/.env
+.devcontainer/.env.agent
 
 # Generated assets
 **/.assets/

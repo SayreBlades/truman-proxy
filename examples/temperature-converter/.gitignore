@@ -1,0 +1,5 @@
+
+# Truman — generated files (contain secrets or host-specific paths)
+.devcontainer/gateway.yaml
+.devcontainer/.env
+.devcontainer/.env.agent

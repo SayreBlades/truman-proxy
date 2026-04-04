@@ -1,14 +1,13 @@
-# Truman example: temperature converter
-# Sandboxed pi agent with credential-injecting gateway.
-# Copy this .devcontainer/ into a project to use Truman.
+# Truman: sandboxed pi agent with credential-injecting gateway.
+# Copy this file (and the rest of .devcontainer/) into your project.
+# See https://github.com/SayreBlades/truman for details.
 
 services:
   gateway:
     image: ghcr.io/sayreblades/truman-gateway:latest
-    env_file:
-      - path: .env
-        required: false
     volumes:
+      - ./gateway.yaml:/etc/gateway/gateway.yaml:ro
+      - ${PI_AUTH_JSON:-/dev/null}:/host-auth/auth.json
       - gateway-data:/data
     networks:
       - sandbox
@@ -23,8 +22,7 @@ services:
     image: ghcr.io/sayreblades/truman-agent:latest
     volumes:
       - ..:/workspace                                        # Project files
-      - /dev/null:/workspace/.devcontainer/.env:ro            # Hide real secrets
-      - /dev/null:/workspace/.devcontainer/.env.example:ro    # Hide template too
+      - /dev/null:/workspace/.devcontainer/gateway.yaml:ro   # Hide real secrets
       - pi-data:/home/pi/.pi/agent                           # Persistent sessions
       # Mount host pi skills/prompts (remove if pi not installed on host)
       - ~/.pi/agent/skills:/opt/pi-custom/skills:ro

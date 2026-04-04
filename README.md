@@ -24,12 +24,12 @@ Truman provides a set of containers that give any project a secure, sandboxed AI
 # 1. Copy the template into your project
 cp -r template/.devcontainer/ /path/to/your-project/.devcontainer/
 
-# 2. Sync your Anthropic credentials
+# 2. Run the interactive setup wizard
 cd /path/to/your-project
-.devcontainer/sync-token.sh
+.devcontainer/truman.sh init
 
-# 3. Add to .gitignore
-echo '.devcontainer/.env' >> .gitignore
+# 3. Start the devcontainer
+.devcontainer/truman.sh start
 ```
 
 Then start using it — see the [template README](template/README.md) for full usage instructions:
@@ -48,7 +48,7 @@ flowchart TB
         end
         
         subgraph EgressNet["🌐 egress network"]
-            Gateway["🛡️ Gateway Container<br/>• Python MITM proxy<br/>• Intercepts configured hosts<br/>• Injects real credentials from .env"]
+            Gateway["🛡️ Gateway Container<br/>• Python MITM proxy<br/>• Intercepts configured hosts<br/>• Injects real credentials from gateway.yaml"]
         end
         
         Agent -->|":8080<br/>All HTTPS traffic"| Gateway
@@ -71,7 +71,7 @@ flowchart TB
 
 1. **Agent** sends all HTTPS requests with dummy API keys through `HTTPS_PROXY` to the gateway
 2. **Gateway** intercepts HTTPS traffic for configured hosts (Anthropic, Brave, GitHub) via MITM
-3. Gateway strips dummy credentials and injects real ones from `.env` before forwarding
+3. Gateway strips dummy credentials and injects real ones from `gateway.yaml` before forwarding
 4. For non-configured hosts, gateway performs blind TCP tunneling (no credential injection)
 5. Agent runs on internal-only network — all traffic must go through gateway
 6. Gateway automatically refreshes OAuth tokens proactively and reactively on 401 responses
@@ -101,10 +101,7 @@ truman/
 │   └── .devcontainer/
 │       ├── devcontainer.json
 │       ├── docker-compose.yml
-│       ├── .env.example
-│       ├── .env.agent
-│       ├── setup.sh
-│       └── sync-token.sh
+│       └── truman.sh
 ├── examples/
 │   └── temperature-converter/
 └── docs/
@@ -118,6 +115,61 @@ Published to GitHub Container Registry:
 |--------------------------------------|--------------------------------------|
 | `ghcr.io/sayreblades/truman-gateway` | MITM proxy with credential injection |
 | `ghcr.io/sayreblades/truman-agent`   | Pi coding agent with tools           |
+
+## Gateway Configuration
+
+The gateway is configured via a single YAML file (`gateway.yaml`) that declares per-host interception rules and credentials. No image rebuild needed to add services.
+
+### Token sharing
+
+OAuth hosts (like Anthropic) support a shared token file via `token_file` + `token_file_key`. This lets the gateway and host tools (like `pi`) share a single access token instead of competing with separate refreshes. The host's `~/.pi/agent/auth.json` is mounted into the gateway container at `/host-auth/auth.json`.
+
+When the gateway starts, it reads the existing access token from the file — no refresh needed. If the token expires, whichever side (host or gateway) detects it first refreshes and writes back, and the other picks up the new token.
+
+### Adding a new service (API key)
+
+Edit `gateway.yaml`:
+
+```yaml
+api.openai.com:
+  type: apikey
+  strip_headers: [authorization]
+  inject_headers:
+    Authorization: "Bearer $API_KEY"
+  api_key: "sk-proj-YOUR-REAL-KEY"
+  agent_env:
+    OPENAI_API_KEY: "sk-proj-DUMMY0000000000000000000000"
+```
+
+Run `setup.sh` to regenerate `.env.agent`. Done — no image rebuild required.
+
+### Adding a new service (OAuth)
+
+For well-known providers in the gateway's built-in registry:
+
+```yaml
+api.newprovider.com:
+  type: oauth
+  provider: newprovider
+  strip_headers: [authorization]
+  inject_headers:
+    Authorization: "Bearer $ACCESS_TOKEN"
+  refresh_token: "rt-YOUR-REFRESH-TOKEN"
+```
+
+For custom OAuth providers, specify protocol details directly:
+
+```yaml
+auth.custom-saas.com:
+  type: oauth
+  token_url: "https://auth.custom-saas.com/oauth/token"
+  client_id: "your-app-client-id"
+  content_type: form
+  strip_headers: [authorization]
+  inject_headers:
+    Authorization: "Bearer $ACCESS_TOKEN"
+  refresh_token: "your-refresh-token"
+```
 
 ## Skills & Prompts
 
@@ -158,14 +210,6 @@ Truman uses the [docker-compose variant](https://containers.dev/implementors/jso
 - Works with GitHub Codespaces
 - Works with DevPod
 
-## Adding New Services
-
-To add credential injection for a new API:
-
-1. Add hostname + header rules to `INTERCEPT_RULES` in `images/gateway/gateway.py`
-2. Add real credential to `.devcontainer/.env`
-3. Add dummy value to `.devcontainer/.env.agent`
-
 ## Usage
 
 See the **[template README](template/README.md)** for detailed instructions on:
@@ -188,3 +232,4 @@ make clean          # Remove locally-built images
 - [Architecture plan](docs/plan.md)
 - [Phase 1: Docker container](docs/plan-phase-1.md)
 - [Phase 2: Secret gateway + network isolation](docs/plan-phase-2.md)
+- [Generalized auth configuration](docs/plan-auth.md)

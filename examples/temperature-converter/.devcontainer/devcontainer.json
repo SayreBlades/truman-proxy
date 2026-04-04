@@ -6,7 +6,7 @@
   "overrideCommand": false,
   "remoteUser": "pi",
   "shutdownAction": "stopCompose",
-  "initializeCommand": ".devcontainer/setup.sh",
+  "initializeCommand": ".devcontainer/truman.sh validate",
   "customizations": {
     "vscode": {
       "settings": {
