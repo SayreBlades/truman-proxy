@@ -218,7 +218,7 @@ services:
     volumes:
       - ..:/workspace
       - /dev/null:/workspace/.devcontainer/.env:ro
-      - pi-data:/home/pi/.pi/agent
+      - pi-data-dev:/home/pi/.pi/agent
       - ~/.pi/agent/skills:/opt/pi-custom/skills:ro
       - ~/.pi/agent/prompts:/opt/pi-custom/prompts:ro
     env_file: [{ path: .env.agent, required: true }]
@@ -241,7 +241,8 @@ networks:
   egress:
 
 volumes:
-  pi-data:
+  pi-data:            # Agent sessions
+  pi-data-dev:        # Dev sessions (separate to avoid rsync conflicts)
   gateway-data:
 ```
 

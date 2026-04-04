@@ -56,7 +56,7 @@ services:
       - ..:/workspace
       - /dev/null:/workspace/.devcontainer/.env:ro
       - /dev/null:/workspace/.devcontainer/.env.example:ro
-      - pi-data:/home/pi/.pi/agent
+      - pi-data-dev:/home/pi/.pi/agent
       - ~/.pi/agent/skills:/opt/pi-custom/skills:ro
       - ~/.pi/agent/prompts:/opt/pi-custom/prompts:ro
     env_file:
@@ -84,5 +84,6 @@ networks:
   egress:             # Gateway and dev can reach internet
 
 volumes:
-  pi-data:
+  pi-data:            # Agent sessions
+  pi-data-dev:        # Dev sessions (separate to avoid rsync conflicts)
   gateway-data:
